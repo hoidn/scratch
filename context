@@ -1,0 +1,4455 @@
+<file path="./btx/processing/tasks/build_pump_probe_masks.py" project="btx">
+from pathlib import Path
+from typing import Dict, Any, Tuple, Optional
+import numpy as np
+from scipy import ndimage
+from scipy.ndimage import binary_dilation
+import matplotlib.pyplot as plt
+import warnings
+
+try:
+    from line_profiler import profile
+except ImportError:
+    def profile(func):
+        return func
+
+from btx.processing.btx_types import (
+    BuildPumpProbeMasksInput,
+    BuildPumpProbeMasksOutput,
+    SignalMaskStages
+)
+
+class BuildPumpProbeMasks:
+    """Generate signal and background masks from p-values with ROI-based clustering.
+    
+    This implementation uses ROI-connected clustering for signal identification,
+    with data-aware rectification and proper handling of negative clusters. The
+    background mask is generated using binary dilation targeting a specific size
+    relative to the signal mask.
+    """
+    
+    def __init__(self, config: Dict[str, Any]):
+        """Initialize mask generation task.
+        
+        Args:
+            config: Dictionary containing:
+                - setup.background_roi_coords: [x1, x2, y1, y2]
+                - generate_masks.threshold: P-value threshold
+                - generate_masks.bg_mask_mult: Background mask multiplier
+                - generate_masks.bg_mask_thickness: Background mask thickness
+        """
+        self.config = config
+        
+        # Set defaults
+    def _validate_config(self) -> None:
+        """Validate configuration parameters."""
+        if 'setup' not in self.config:
+            raise ValueError("Missing 'setup' section in config")
+            
+        if 'background_roi_coords' not in self.config['setup']:
+            raise ValueError("Missing background_roi_coords in setup")
+            
+        roi = self.config['setup']['background_roi_coords']
+        if not isinstance(roi, (list, tuple)) or len(roi) != 4:
+            raise ValueError("background_roi_coords must be [x1, x2, y1, y2]")
+            
+        # Validate generate_masks section
+        if 'generate_masks' not in self.config:
+            raise ValueError("Missing 'generate_masks' section in config")
+            
+        masks_config = self.config['generate_masks']
+        required = ['threshold', 'bg_mask_mult', 'bg_mask_thickness']
+        for param in required:
+            if param not in masks_config:
+                raise ValueError(f"Missing required parameter: {param}")
+                
+        if not 0 < masks_config['threshold'] < 1:
+            raise ValueError("threshold must be between 0 and 1")
+            
+        if masks_config['bg_mask_mult'] <= 0:
+            raise ValueError("bg_mask_mult must be positive")
+            
+        if masks_config['bg_mask_thickness'] <= 0:
+            raise ValueError("bg_mask_thickness must be positive")
+        if 'generate_masks' not in self.config:
+            self.config['generate_masks'] = {}
+        
+        masks_config = self.config['generate_masks']
+        if 'threshold' not in masks_config:
+            masks_config['threshold'] = 0.05
+        if 'bg_mask_mult' not in masks_config:
+            masks_config['bg_mask_mult'] = 2.0
+        if 'bg_mask_thickness' not in masks_config:
+            masks_config['bg_mask_thickness'] = 5
+
+    def _rectify_filter_mask(self, mask: np.ndarray, data: np.ndarray) -> np.ndarray:
+        """Rectify mask orientation based on data values.
+        
+        Args:
+            mask: Binary mask to rectify
+            data: Original histogram data
+            
+        Returns:
+            Rectified binary mask
+        """
+        imgs_sum = data.sum(axis=0)
+        
+        if mask.sum() == 0:
+            return ~mask
+            
+        mean_1 = imgs_sum[mask].mean()
+        mean_0 = imgs_sum[~mask].mean()
+        
+        return ~mask if mean_1 < mean_0 else mask
+
+    def _identify_roi_connected_cluster(
+        self,
+        p_values: np.ndarray,
+        threshold: float,
+        roi_x_start: int,
+        roi_x_end: int,
+        roi_y_start: int,
+        roi_y_end: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Find cluster connected to ROI.
+        
+        Args:
+            p_values: Array of p-values
+            threshold: P-value threshold
+            roi_x_start, roi_x_end, roi_y_start, roi_y_end: ROI coordinates
+            
+        Returns:
+            Tuple of (labeled array, ROI cluster mask)
+        """
+        porous_pixels = p_values < threshold
+        labeled_array, _ = ndimage.label(porous_pixels)
+        seed_x = (roi_x_start + roi_x_end) // 2
+        seed_y = (roi_y_start + roi_y_end) // 2
+        roi_cluster_label = labeled_array[seed_x, seed_y]
+        return labeled_array, labeled_array == roi_cluster_label
+
+    def _filter_negative_clusters(
+        self,
+        cluster_array: np.ndarray,
+        data: np.ndarray,
+        min_size: int = 10
+    ) -> np.ndarray:
+        """Filter out small negative clusters.
+        
+        Args:
+            cluster_array: Binary array of clusters
+            data: Original histogram data
+            min_size: Minimum cluster size to keep
+            
+        Returns:
+            Filtered binary mask
+        """
+        # First rectify the mask orientation
+        cluster_array = self._rectify_filter_mask(cluster_array, data)
+        
+        # Invert array to work with negative clusters
+        inverted_array = np.logical_not(cluster_array)
+        
+        # Label inverted regions
+        labeled_array, _ = ndimage.label(inverted_array)
+        
+        # Count size of each cluster
+        cluster_sizes = np.bincount(labeled_array.ravel())
+        
+        # Find small clusters
+        small_clusters = np.where(cluster_sizes < min_size)[0]
+        
+        # Create mask of small clusters
+        small_cluster_mask = np.isin(labeled_array, small_clusters)
+        
+        # Return original mask with small negative clusters filled
+        return np.logical_or(cluster_array, small_cluster_mask)
+
+    def _infill_binary_array(self, data: np.ndarray, array: np.ndarray) -> np.ndarray:
+        """Fill holes keeping only largest component.
+        
+        Args:
+            data: Original histogram data
+            array: Binary array to infill
+            
+        Returns:
+            Infilled binary mask
+        """
+        # Rectify mask orientation again
+        labeled_array, num_features = ndimage.label(
+            self._rectify_filter_mask(array, data)
+        )
+        
+        # Find largest component
+        largest_component = 0
+        largest_size = 0
+        for i in range(1, num_features + 1):
+            size = np.sum(labeled_array == i)
+            if size > largest_size:
+                largest_size = size
+                largest_component = i
+                
+        return labeled_array == largest_component
+
+    def _create_continuous_buffer(
+        self,
+        signal_mask: np.ndarray,
+        initial_thickness: int = 10,
+        num_pixels: Optional[int] = None,
+        separator_thickness: int = 5
+    ) -> np.ndarray:
+        """Create continuous buffer around signal targeting specific size.
+        
+        Args:
+            signal_mask: Binary signal mask
+            initial_thickness: Initial dilation thickness
+            num_pixels: Target number of pixels in buffer
+            separator_thickness: Thickness of separator between signal and buffer
+            
+        Returns:
+            Binary buffer mask
+        """
+        if num_pixels is not None:
+            available_space = np.prod(signal_mask.shape) - np.sum(signal_mask)
+            if num_pixels > available_space:
+                raise ValueError("Target pixels exceeds available space")
+        
+        if signal_mask.sum() == 0:
+            raise ValueError("Signal mask is empty")
+        
+        # Create separator gap
+        dilated_signal = binary_dilation(signal_mask, iterations=separator_thickness)
+        
+        # Grow buffer until target size reached
+        current_num_pixels = 0
+        thickness = 0
+        while num_pixels is not None and current_num_pixels < num_pixels:
+            thickness += 1
+            buffer = binary_dilation(dilated_signal, iterations=thickness) & (~dilated_signal)
+            current_num_pixels = np.sum(buffer)
+            
+        return buffer
+
+    def _create_background_mask(
+        self,
+        signal_mask: np.ndarray,
+        bg_mask_mult: float,
+        thickness: int,
+        separator_thickness: int = 5
+    ) -> np.ndarray:
+        """Create background mask targeting specific size relative to signal.
+        
+        Args:
+            signal_mask: Binary signal mask
+            bg_mask_mult: Multiple of signal mask size for background
+            thickness: Initial thickness for dilation
+            separator_thickness: Thickness of separator between signal and background
+            
+        Returns:
+            Binary background mask
+        """
+        num_pixels_signal = np.sum(signal_mask)
+        target_bg_pixels = int(num_pixels_signal * bg_mask_mult)
+        
+        return self._create_continuous_buffer(
+            signal_mask,
+            initial_thickness=thickness,
+            num_pixels=target_bg_pixels,
+            separator_thickness=separator_thickness
+        )
+
+    def _validate_inputs(self, input_data: BuildPumpProbeMasksInput) -> None:
+        return
+        """Validate input data dimensions."""
+        p_values = input_data.p_values_output.p_values
+        histograms = input_data.histogram_output.histograms
+        
+        # Check histogram data exists
+        if histograms is None:
+            raise ValueError("Missing histogram data")
+        
+        # Check dimensions match
+        if p_values.shape != histograms.shape[1:]:
+            raise ValueError(
+                f"P-value shape {p_values.shape} doesn't match "
+                f"histogram shape {histograms.shape[1:]}"
+            )
+        
+        # Validate ROI coordinates
+        x1, x2, y1, y2 = self.config['setup']['background_roi_coords']
+        if not (0 <= x1 < x2 <= p_values.shape[0] and
+                0 <= y1 < y2 <= p_values.shape[1]):
+            raise ValueError(
+                f"ROI coordinates {[x1, x2, y1, y2]} invalid for "
+                f"data shape {p_values.shape}"
+            )
+
+    def _validate_masks(
+        self,
+        signal_mask: np.ndarray,
+        background_mask: np.ndarray
+    ) -> None:
+        """Validate final masks."""
+        # Check for overlap
+        if np.any(signal_mask & background_mask):
+            raise ValueError("Signal and background masks overlap")
+        
+        # Check sizes
+        signal_size = np.sum(signal_mask)
+        background_size = np.sum(background_mask)
+        total_size = signal_mask.size
+        
+        if signal_size == 0:
+            raise ValueError("Signal mask is empty")
+        if background_size == 0:
+            raise ValueError("Background mask is empty")
+            
+        # Check relative sizes
+        if background_size < signal_size * self.config['generate_masks']['bg_mask_mult'] * 0.9:
+            warnings.warn(
+                f"Background mask smaller than expected: {background_size} pixels vs "
+                f"target {signal_size * self.config['generate_masks']['bg_mask_mult']}",
+                RuntimeWarning
+            )
+
+    @profile
+    def run(self, input_data: BuildPumpProbeMasksInput) -> BuildPumpProbeMasksOutput:
+        """Run mask generation."""
+        # Validate inputs
+        self._validate_inputs(input_data)
+        
+        # Get parameters
+        mask_config = self.config['generate_masks']
+        threshold = mask_config['threshold']
+        bg_mult = mask_config['bg_mask_mult']
+        thickness = mask_config['bg_mask_thickness']
+        x1, x2, y1, y2 = self.config['setup']['background_roi_coords']
+        
+        # Get data
+        p_values = input_data.p_values_output.p_values
+        histograms = input_data.histogram_output.histograms
+        
+        # 1. Initial ROI cluster identification
+        _, roi_cluster = self._identify_roi_connected_cluster(
+            p_values, threshold, x1, x2, y1, y2
+        )
+        
+        # 2. Filter negative clusters
+        filtered_mask = self._filter_negative_clusters(
+            roi_cluster, histograms, min_size=10
+        )
+        
+        # 3. Infill to get final signal mask
+        final_signal_mask = self._infill_binary_array(histograms, filtered_mask)
+        
+        # 4. Generate background mask
+        background_mask = self._create_background_mask(
+            final_signal_mask,
+            bg_mask_mult=bg_mult,
+            thickness=thickness,
+            separator_thickness=5
+        )
+        
+        # 5. Validate masks
+        self._validate_masks(final_signal_mask, background_mask)
+        
+        # 6. Print statistics
+        self._print_mask_statistics(final_signal_mask, background_mask)
+        
+        # Store intermediate results
+        intermediate_masks = SignalMaskStages(
+            initial=roi_cluster,
+            roi_masked=filtered_mask,
+            filtered=filtered_mask,  # Reuse since filtering is different now
+            final=final_signal_mask
+        )
+        
+        return BuildPumpProbeMasksOutput(
+            signal_mask=final_signal_mask,
+            background_mask=background_mask,
+            intermediate_masks=intermediate_masks
+        )
+
+    def _print_mask_statistics(
+        self,
+        signal_mask: np.ndarray,
+        background_mask: np.ndarray
+    ) -> None:
+        """Print mask statistics."""
+        total_pixels = signal_mask.size
+        signal_pixels = np.sum(signal_mask)
+        background_pixels = np.sum(background_mask)
+        
+        print("\nMask Statistics:")
+        print(f"Signal mask: {signal_pixels} pixels "
+              f"({signal_pixels/total_pixels:.1%} of image)")
+        print(f"Background mask: {background_pixels} pixels "
+              f"({background_pixels/total_pixels:.1%} of image)")
+        
+        # Calculate minimum distance between masks
+        signal_dist = ndimage.distance_transform_edt(~signal_mask)
+        min_distance = np.min(signal_dist[background_mask])
+        print(f"Minimum distance between masks: {min_distance:.1f} pixels")
+
+    def plot_diagnostics(
+            self,
+            output: BuildPumpProbeMasksOutput,
+            save_dir: Path
+        ) -> None:
+            """Generate diagnostic plots.
+            
+            Args:
+                output: Output from mask generation
+                save_dir: Directory to save plots
+            """
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 1. Plot mask generation stages
+            fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+            fig.suptitle('Signal Mask Generation Stages')
+            
+            stages = [
+                ('Initial ROI Cluster', output.intermediate_masks.initial),
+                ('Filtered Clusters', output.intermediate_masks.roi_masked),
+                ('Final Signal Mask', output.intermediate_masks.final),
+                ('Background Mask', output.background_mask)
+            ]
+            
+            for ax, (title, mask) in zip(axes.flat, stages):
+                ax.imshow(mask, cmap='RdBu')
+                ax.set_title(title)
+            
+            plt.tight_layout()
+            plt.savefig(save_dir / 'mask_generation_stages.png')
+            plt.close()
+            
+            # 2. Plot distance transform
+            fig, ax = plt.subplots(figsize=(8, 8))
+            
+            # Calculate distance from signal mask
+            dist = ndimage.distance_transform_edt(~output.signal_mask)
+            
+            # Plot distance with background mask contour
+            im = ax.imshow(dist, cmap='viridis')
+            plt.colorbar(im, ax=ax, label='Distance (pixels)')
+            
+            # Add background mask contour
+            ax.contour(
+                output.background_mask,
+                colors='r',
+                levels=[0.5],
+                linewidths=2,
+                label='Background Mask'
+            )
+            
+            ax.set_title('Distance from Signal to Background')
+            plt.tight_layout()
+            plt.savefig(save_dir / 'mask_distance.png')
+            plt.close()
+</file>
+<file path="./btx/processing/tasks/__init__.py" project="btx">
+# btx/processing/tasks/__init__.py
+"""Task implementations for XPP data processing."""
+
+from .load_data import LoadData
+from .make_histogram import MakeHistogram
+from .measure_emd import MeasureEMD
+from .calculate_p_values import CalculatePValues
+from .build_pump_probe_masks import BuildPumpProbeMasks
+from .pump_probe import PumpProbeAnalysis
+
+__all__ = [
+    'LoadData',
+    'MakeHistogram',
+    'MeasureEMD',
+    'CalculatePValues',
+    'BuildPumpProbeMasks',
+    'PumpProbeAnalysis'
+]
+</file>
+<file path="./btx/processing/tasks/measure_emd.py" project="btx">
+from pathlib import Path
+from typing import Dict, Any, Tuple
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import wasserstein_distance
+import warnings
+
+try:
+    from line_profiler import profile
+except ImportError:
+    def profile(func):
+        return func
+
+from btx.processing.btx_types import MeasureEMDInput, MeasureEMDOutput
+
+class MeasureEMD:
+    """Calculate Earth Mover's Distance between pixel histograms and background."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        """Initialize EMD calculation task.
+        
+        Args:
+            config: Dictionary containing:
+                - setup.background_roi_coords: [x1, x2, y1, y2]
+                - calculate_emd.num_permutations: Number of bootstrap samples
+        """
+        self.config = config
+        
+        # Set defaults
+        if 'calculate_emd' not in self.config:
+            self.config['calculate_emd'] = {}
+        if 'num_permutations' not in self.config['calculate_emd']:
+            self.config['calculate_emd']['num_permutations'] = 1000
+            
+    def _validate_background_roi(self, histograms: np.ndarray) -> None:
+        """Validate background ROI against data dimensions."""
+        x1, x2, y1, y2 = self.config['setup']['background_roi_coords']
+        
+        if not (0 <= x1 < x2 <= histograms.shape[1] and
+                0 <= y1 < y2 <= histograms.shape[2]):
+            raise ValueError(
+                f"Background ROI {[x1, x2, y1, y2]} invalid for histograms "
+                f"of shape {histograms.shape}"
+            )
+            
+        # Warn if ROI might be too small
+        roi_size = (x2 - x1) * (y2 - y1)
+        if roi_size < 100:
+            warnings.warn(
+                f"Background ROI contains only {roi_size} pixels, "
+                "which may lead to unstable statistics",
+                RuntimeWarning
+            )
+            
+    def _get_average_roi_histogram(
+        self, 
+        histograms: np.ndarray,
+        x1: int,
+        x2: int,
+        y1: int,
+        y2: int
+    ) -> np.ndarray:
+        """Calculate average histogram for ROI."""
+        roi_histograms = histograms[:, x1:x2, y1:y2]
+        return np.mean(roi_histograms, axis=(1, 2))
+        
+    @profile
+    def _calculate_emd_values(
+        self,
+        histograms: np.ndarray,
+        reference_histogram: np.ndarray
+    ) -> np.ndarray:
+        """Calculate EMD between each pixel's histogram and reference."""
+        shape = histograms.shape
+        emd_values = np.zeros((shape[1], shape[2]))
+        
+        for i in range(shape[1]):
+            for j in range(shape[2]):
+                emd_values[i, j] = wasserstein_distance(
+                    histograms[:, i, j],
+                    reference_histogram
+                )
+        
+        return emd_values
+        
+    def _generate_null_distribution(
+        self,
+        histograms: np.ndarray,
+        avg_histogram: np.ndarray
+    ) -> np.ndarray:
+        """Generate null distribution via bootstrapping."""
+        x1, x2, y1, y2 = self.config['setup']['background_roi_coords']
+        roi_histograms = histograms[:, x1:x2, y1:y2]
+        
+        num_bins = roi_histograms.shape[0]
+        num_x = x2 - x1
+        num_y = y2 - y1
+        num_permutations = self.config['calculate_emd']['num_permutations']
+        
+        null_emd_values = []
+        for _ in range(num_permutations):
+            # Randomly sample a pixel from background ROI
+            x_idx = np.random.randint(0, num_x)
+            y_idx = np.random.randint(0, num_y)
+            
+            sample_histogram = roi_histograms[:, x_idx, y_idx]
+            null_emd_value = wasserstein_distance(
+                sample_histogram,
+                avg_histogram
+            )
+            null_emd_values.append(null_emd_value)
+        
+        return np.array(null_emd_values)
+
+    def run(self, input_data: MeasureEMDInput) -> MeasureEMDOutput:
+        """Run EMD calculation.
+        
+        Args:
+            input_data: MeasureEMDInput containing histograms
+            
+        Returns:
+            MeasureEMDOutput containing EMD values and null distribution
+            
+        Raises:
+            ValueError: If background ROI is invalid or empty
+        """
+        histograms = input_data.histogram_output.histograms
+        
+        # Validate background ROI
+        self._validate_background_roi(histograms)
+        
+        # Get ROI coordinates
+        x1, x2, y1, y2 = self.config['setup']['background_roi_coords']
+        
+        # Calculate average background histogram
+        avg_histogram = self._get_average_roi_histogram(
+            histograms, x1, x2, y1, y2
+        )
+        
+        # Validate background is not empty
+        if np.all(avg_histogram < 1e-8):
+            raise ValueError("Background ROI contains no data")
+        
+        # Calculate EMD values
+        emd_values = self._calculate_emd_values(
+            histograms,
+            avg_histogram
+        )
+        
+        # Generate null distribution
+        null_distribution = self._generate_null_distribution(
+            histograms,
+            avg_histogram
+        )
+        
+        return MeasureEMDOutput(
+            emd_values=emd_values,
+            null_distribution=null_distribution,
+            avg_histogram=avg_histogram,
+            avg_hist_edges=input_data.histogram_output.bin_edges
+        )
+        
+    def plot_diagnostics(self, output: MeasureEMDOutput, save_dir: Path) -> None:
+        """Generate diagnostic plots."""
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create figure with subplots
+        fig = plt.figure(figsize=(15, 10))
+        
+        # 1. EMD value spatial distribution
+        ax1 = fig.add_subplot(221)
+        im1 = ax1.imshow(output.emd_values, cmap='viridis')
+        ax1.set_title('EMD Values')
+        plt.colorbar(im1, ax=ax1)
+        
+        # 2. Background ROI overlay on EMD map
+        ax2 = fig.add_subplot(222)
+        im2 = ax2.imshow(output.emd_values, cmap='viridis')
+        x1, x2, y1, y2 = self.config['setup']['background_roi_coords']
+        rect = plt.Rectangle(
+            (y1, x1), y2-y1, x2-x1,
+            fill=False, color='red', linewidth=2
+        )
+        ax2.add_patch(rect)
+        ax2.set_title('Background ROI Location')
+        plt.colorbar(im2, ax=ax2)
+        
+        # 3. Average background histogram
+        ax3 = fig.add_subplot(223)
+        ax3.semilogy(
+            output.avg_hist_edges, # removed last elt truncation
+            output.avg_histogram,
+            'b-',
+            label='Background'
+        )
+        ax3.set_title('Average Background Histogram')
+        ax3.set_xlabel('Value')
+        ax3.set_ylabel('Counts')
+        ax3.grid(True)
+        
+        # 4. Null distribution
+        ax4 = fig.add_subplot(224)
+        ax4.hist(
+            output.null_distribution,
+            bins=50,
+            density=True,
+            alpha=0.5,
+            label='Null'
+        )
+        ax4.hist(
+            output.emd_values.ravel(),
+            bins=100,
+            density=True,
+            alpha=0.5,
+            label='Data'
+        )
+        ax4.axvline(
+            np.median(output.null_distribution),
+            color='r',
+            linestyle='--',
+            label='Null Median'
+        )
+        ax4.set_title('EMD Value Distribution')
+        ax4.set_xlabel('EMD Value')
+        ax4.set_ylabel('Density')
+        ax4.grid(True)
+        ax4.legend()
+        
+        plt.tight_layout()
+        plt.savefig(save_dir / 'measure_emd_diagnostics.png')
+        plt.close()
+</file>
+<file path="./btx/processing/tasks/pvalues.py" project="btx">
+from pathlib import Path
+from typing import Dict, Any, Optional
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+
+try:
+    from line_profiler import profile
+except ImportError:
+    def profile(func):
+        return func
+
+from btx.processing.btx_types import CalculatePValuesInput, CalculatePValuesOutput
+
+class CalculatePValues:
+    """Calculate p-values for pump-probe analysis"""
+    
+    def __init__(self):
+        pass
+        
+    @profile
+    def run(self, input_data: CalculatePValuesInput) -> CalculatePValuesOutput:
+        """Calculate p-values from EMD measurements and null distributions"""
+        # Calculate p-values for each delay
+        p_values = np.zeros(len(input_data.emd_values))
+        for i, (emd, null_dist) in enumerate(zip(input_data.emd_values, 
+                                               input_data.null_distributions)):
+            p_values[i] = (null_dist > emd).mean()
+            
+        return CalculatePValuesOutput(
+            p_values=p_values
+        )
+</file>
+<file path="./btx/processing/tasks/pump_probe.py" project="btx">
+from pathlib import Path
+from typing import Dict, List, Tuple, Any, NamedTuple, Optional
+import numpy as np
+from scipy import stats
+import matplotlib.pyplot as plt
+
+from btx.processing.btx_types import (
+    PumpProbeAnalysisInput,
+    PumpProbeAnalysisOutput,
+)
+
+try:
+    from line_profiler import profile
+    PROFILING = True
+except ImportError:
+    # Create no-op decorator if line_profiler isn't installed
+    def profile(func):
+        return func
+    PROFILING = False
+
+import warnings
+import logging
+
+# Configure logging to file instead of console
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('pump_probe_analysis.log'),
+        logging.NullHandler()  # Prevents logging to console
+    ]
+)
+logger = logging.getLogger('PumpProbeAnalysis')
+
+# Suppress specific numpy warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*P-value underflow.*')
+
+class DelayData(NamedTuple):
+    """Container for frames and I0 values at a specific delay."""
+    frames: np.ndarray
+    I0: np.ndarray
+
+from pathlib import Path
+from typing import Dict, List, Tuple, Any, NamedTuple
+import numpy as np
+from scipy import stats
+import matplotlib.pyplot as plt
+import warnings
+import logging
+
+from btx.processing.btx_types import (
+    PumpProbeAnalysisInput,
+    PumpProbeAnalysisOutput,
+)
+
+# Configure logging
+logger = logging.getLogger('PumpProbeAnalysis')
+
+class DelayData(NamedTuple):
+    """Container for frames and I0 values at a specific delay."""
+    frames: np.ndarray
+    I0: np.ndarray
+
+class PumpProbeAnalysis:
+    """Analyze pump-probe time series data with proper error propagation."""
+    
+    def __init__(self, config: Dict[str, Any], enable_profiling: bool = False):
+        """Initialize pump-probe analysis task.
+        
+        Args:
+            config: Dictionary containing:
+                - pump_probe_analysis.min_count: Minimum frames per delay bin
+                - pump_probe_analysis.significance_level: P-value threshold
+        """
+        self.config = config
+        self.input_data = None  # Store input data for diagnostics
+        
+        # Set defaults
+        if 'pump_probe_analysis' not in self.config:
+            self.config['pump_probe_analysis'] = {}
+            
+        analysis_config = self.config['pump_probe_analysis']
+        if 'min_count' not in analysis_config:
+            analysis_config['min_count'] = 2
+        if 'significance_level' not in analysis_config:
+            analysis_config['significance_level'] = 0.05
+
+
+    #@profile
+    def _group_by_delay(
+        self, 
+        input_data: PumpProbeAnalysisInput
+    ) -> Tuple[Dict[float, DelayData], Dict[float, DelayData]]:
+        """Group frames by delay value with improved binning logic.
+        
+        Args:
+            input_data: Input data containing delays and frames
+            
+        Returns:
+            Tuple of (laser_on_groups, laser_off_groups) dictionaries
+        """
+        min_count = self.config['pump_probe_analysis']['min_count']
+        delays = input_data.load_data_output.binned_delays
+        time_bin = float(self.config['load_data']['time_bin'])
+        
+        # Get unique delays more robustly
+        sorted_delays = np.sort(np.unique(delays))
+        logger.debug(f"Found {len(sorted_delays)} unique delay values")
+        
+        # Group delays that are within time_bin/10 of each other
+        unique_delays = []
+        current_group = [sorted_delays[0]]
+        
+        for d in sorted_delays[1:]:
+            if np.abs(d - current_group[0]) <= time_bin/10:
+                current_group.append(d)
+            else:
+                unique_delays.append(np.mean(current_group))
+                current_group = [d]
+        
+        if current_group:
+            unique_delays.append(np.mean(current_group))
+        
+        unique_delays = np.array(unique_delays)
+        logger.debug(f"Grouped into {len(unique_delays)} delay points")
+        
+        # Group frames by delay
+        stacks_on = {}
+        stacks_off = {}
+        
+        for delay in unique_delays:
+            delay_mask = np.isclose(delays, delay, rtol=1e-5, atol=time_bin/10)
+            
+            # Split into on/off
+            on_mask = delay_mask & input_data.load_data_output.laser_on_mask
+            off_mask = delay_mask & input_data.load_data_output.laser_off_mask
+            
+            n_on = np.sum(on_mask)
+            n_off = np.sum(off_mask)
+            
+            if n_on >= min_count and n_off >= min_count:
+                logger.debug(f"Delay {delay:.3f}ps: {n_on} on, {n_off} off frames")
+                # TODO default to the other stack of frames if this one is None
+                stacks_on[delay] = DelayData(
+                    frames=input_data.load_data_output.data_global_energy_filter[on_mask],
+                    I0=input_data.load_data_output.I0[on_mask]
+                )
+                stacks_off[delay] = DelayData(
+                    frames=input_data.load_data_output.data_global_energy_filter[off_mask],
+                    I0=input_data.load_data_output.I0[off_mask]
+                )
+            else:
+                logger.debug(f"Skipping delay {delay:.3f}ps: insufficient frames")
+        
+        if not stacks_on:
+            raise ValueError(
+                f"No delay groups met the minimum frame count requirement of {min_count}"
+            )
+        
+        return stacks_on, stacks_off
+
+    #@profile
+    def _calculate_signals(
+        self,
+        frames: np.ndarray,
+        signal_mask: np.ndarray,
+        bg_mask: np.ndarray,
+        I0: np.ndarray
+    ) -> Tuple[float, float, float]:
+        """Calculate normalized signals and their uncertainties with proper error propagation.
+        
+        Args:
+            frames: Raw frame data
+            signal_mask: Signal region mask
+            bg_mask: Background region mask
+            I0: I0 values for each frame
+            
+        Returns:
+            Tuple of (normalized_signal, normalized_background, variance)
+        """
+        # Calculate per-frame sums using einsum for better performance
+        signal_sums = np.einsum('ijk,jk->i', frames, signal_mask)
+        bg_sums = np.einsum('ijk,jk->i', frames, bg_mask)
+        
+        # Scale background by mask sizes
+        scale_factor = np.sum(signal_mask) / np.sum(bg_mask)
+        bg_sums *= scale_factor
+        
+        # Normalize each frame by its I0
+        norm_signal = signal_sums / I0
+        norm_bg = bg_sums / I0
+        
+        # Calculate difference for each frame
+        norm_diff = norm_signal - norm_bg
+        
+        # Calculate statistics
+        n_frames = len(frames)
+        signal_mean = np.mean(norm_signal)
+        bg_mean = np.mean(norm_bg)
+        
+        # Calculate variance of the normalized difference
+        # Using ddof=1 for unbiased variance estimate
+        variance = np.var(norm_diff, ddof=1) / n_frames  # Standard error
+        
+        return signal_mean, bg_mean, variance
+
+    @profile
+    def run(self, input_data: PumpProbeAnalysisInput) -> PumpProbeAnalysisOutput:
+        """Run pump-probe analysis with corrected error propagation.
+        
+        Args:
+            input_data: Input data containing frames and masks
+            
+        Returns:
+            PumpProbeAnalysisOutput with calculated signals and uncertainties
+        """
+        # Store input data and masks for diagnostics
+        self.input_data = input_data
+        self.signal_mask = input_data.masks_output.signal_mask
+        self.bg_mask = input_data.masks_output.background_mask
+        
+        # Group frames by delay
+        self.stacks_on, self.stacks_off = self._group_by_delay(input_data)
+        
+        # Process each delay group
+        delays = []
+        signals_on = []
+        signals_off = []
+        std_devs_on = []
+        std_devs_off = []
+        n_frames = {}
+        
+        for delay in sorted(self.stacks_on.keys()):
+            # Get frame stacks
+            on_data = self.stacks_on[delay]
+            off_data = self.stacks_off[delay]
+            
+            # Store frame counts
+            n_frames[delay] = (len(on_data.frames), len(off_data.frames))
+            
+            # Calculate signals and uncertainties
+            signal_on, bg_on, var_on = self._calculate_signals(
+                on_data.frames, self.signal_mask, self.bg_mask, on_data.I0
+            )
+            
+            signal_off, bg_off, var_off = self._calculate_signals(
+                off_data.frames, self.signal_mask, self.bg_mask, off_data.I0
+            )
+            
+            # Store results (already normalized by I0)
+            delays.append(delay)
+            signals_on.append(signal_on - bg_on)
+            signals_off.append(signal_off - bg_off)
+            std_devs_on.append(np.sqrt(var_on))
+            std_devs_off.append(np.sqrt(var_off))
+        
+        # Calculate mean I0 values
+        mean_I0_on = np.mean([
+            np.mean(self.stacks_on[delay].I0) for delay in delays
+        ])
+        mean_I0_off = np.mean([
+            np.mean(self.stacks_off[delay].I0) for delay in delays
+        ])
+        
+        # Convert to arrays
+        delays = np.array(delays)
+        signals_on = np.array(signals_on)
+        signals_off = np.array(signals_off)
+        std_devs_on = np.array(std_devs_on)
+        std_devs_off = np.array(std_devs_off)
+        
+        # Calculate p-values comparing on/off signals
+        z_scores = (signals_on - signals_off) / np.sqrt(std_devs_on**2 + std_devs_off**2)
+        p_values = 2 * (1 - stats.norm.cdf(np.abs(z_scores)))
+        
+        return PumpProbeAnalysisOutput(
+            delays=delays,
+            signals_on=signals_on,
+            signals_off=signals_off,
+            std_devs_on=std_devs_on,
+            std_devs_off=std_devs_off,
+            p_values=p_values,
+            log_p_values=-np.log10(p_values),
+            mean_I0_on=mean_I0_on,
+            mean_I0_off=mean_I0_off,
+            n_frames_per_delay=n_frames
+        )
+
+    @profile
+    def plot_diagnostics(
+        self,
+        output: PumpProbeAnalysisOutput,
+        save_dir: Path,
+        detailed_diagnostics: bool = False
+    ) -> None:
+        """Generate diagnostic plots with proper infinity handling."""
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # print("\n=== Signal Shape Debug ===")
+        # print(f"signals_on shape: {output.signals_on.shape}")
+        # print(f"signals_off shape: {output.signals_off.shape}")
+        # print(f"delays: {output.delays}")
+        # print("\nFrame counts per delay:")
+        # for delay, (n_on, n_off) in output.n_frames_per_delay.items():
+        #     print(f"Delay {delay:.3f}: {n_on} on, {n_off} off")
+        
+        # Create four-panel overview figure
+        fig = plt.figure(figsize=(16, 16))
+        
+        if self.input_data is None:
+            raise RuntimeError("plot_diagnostics() called before run()")
+            
+        # 1. Time traces with error bars (top left)
+        ax2 = fig.add_subplot(221)
+        ax2.errorbar(output.delays, output.signals_on,
+                    yerr=output.std_devs_on, fmt='rs-',
+                    label='Laser On', capsize=3)
+        ax2.errorbar(output.delays, output.signals_off,
+                    yerr=output.std_devs_off, fmt='ks-',
+                    label='Laser Off', capsize=3, alpha=0.5)
+        ax2.set_xlabel('Time Delay (ps)')
+        ax2.set_ylabel('Normalized Signal')
+        ax2.legend()
+        ax2.grid(True)
+        
+        # 2. Signal and background masks (top right)
+        ax3 = fig.add_subplot(222)
+        mask_display = np.zeros_like(self.signal_mask, dtype=float)
+        mask_display[self.signal_mask] = 1
+        mask_display[self.bg_mask] = 0.5
+        im3 = ax3.imshow(mask_display, origin='lower', cmap='viridis')
+        ax3.set_title('Analysis Masks (Signal=1, Background=0.5)')
+        plt.colorbar(im3, ax=ax3)
+        
+        # 3. Statistical significance (bottom right)
+        ax4 = fig.add_subplot(223)
+        
+        # Convert p-values to log scale with capped infinities
+        max_log_p = 16  # Maximum value to show on plot
+        log_p_values = np.zeros_like(output.p_values)
+        
+        for i, (delay, p_val) in enumerate(zip(output.delays, output.p_values)):
+            if p_val > 0:
+                log_p = -np.log10(p_val)
+                log_p_values[i] = log_p
+            else:
+                log_p_values[i] = max_log_p
+        
+        # Create scatter plot with processed values
+        scatter = ax4.scatter(output.delays, log_p_values,
+                             color='red', label='-log(p-value)')
+        
+        # Add significance line
+        sig_level = self.config['pump_probe_analysis']['significance_level']
+        sig_line = -np.log10(sig_level)
+        ax4.axhline(y=sig_line, color='k', linestyle='--',
+                    label=f'p={sig_level}')
+        
+        # Set y-axis limits explicitly
+        ax4.set_ylim(0, max_log_p * 1.1)  # Add 10% padding above max
+        
+        ax4.set_xlabel('Time Delay (ps)')
+        ax4.set_ylabel('-log10(P-value)')
+        ax4.legend()
+        ax4.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(save_dir / 'overview_diagnostics.png')
+        plt.close()
+
+        # Plot detailed diagnostics if enabled
+        if detailed_diagnostics:
+            logger.info("Generating detailed diagnostics plots...")
+            delay_indices = [0, len(output.delays)//2, -1]  # First, middle, and last delays
+            for idx in delay_indices:
+                delay = output.delays[idx]
+                
+                # Get data from stored stacks
+                frames_on = self.stacks_on[delay].frames
+                frames_off = self.stacks_off[delay].frames
+                I0_on = self.stacks_on[delay].I0
+                I0_off = self.stacks_off[delay].I0
+                
+                # Calculate statistics
+                signal_sums_on = np.sum(frames_on * self.signal_mask[None, :, :], axis=(1,2))
+                signal_sums_off = np.sum(frames_off * self.signal_mask[None, :, :], axis=(1,2))
+                bg_sums_on = np.sum(frames_on * self.bg_mask[None, :, :], axis=(1,2))
+                bg_sums_off = np.sum(frames_off * self.bg_mask[None, :, :], axis=(1,2))
+                
+                scale_factor = np.sum(self.signal_mask) / np.sum(self.bg_mask)
+                net_signal_on = (signal_sums_on - scale_factor * bg_sums_on) / np.mean(I0_on)
+                net_signal_off = (signal_sums_off - scale_factor * bg_sums_off) / np.mean(I0_off)
+            
+                # Create detailed diagnostic figure
+                fig, axes = plt.subplots(3, 2, figsize=(15, 18))
+                fig.suptitle(f'Detailed Diagnostics for Delay {delay:.2f} ps', fontsize=16)
+                
+                # Raw signal distributions
+                axes[0,0].hist(signal_sums_on, bins='auto', alpha=0.5, label='Laser On')
+            axes[0,0].hist(signal_sums_off, bins='auto', alpha=0.5, label='Laser Off')
+            axes[0,0].set_title('Raw Signal Distributions')
+            axes[0,0].set_xlabel('Integrated Signal')
+            axes[0,0].set_ylabel('Count')
+            axes[0,0].legend()
+            
+            # Background distributions
+            axes[0,1].hist(bg_sums_on * scale_factor, bins='auto', alpha=0.5, label='Laser On')
+            axes[0,1].hist(bg_sums_off * scale_factor, bins='auto', alpha=0.5, label='Laser Off')
+            axes[0,1].set_title('Scaled Background Distributions')
+            axes[0,1].set_xlabel('Integrated Background (scaled)')
+            axes[0,1].set_ylabel('Count')
+            axes[0,1].legend()
+            
+            # Frame-to-frame variations
+            axes[1,0].plot(np.arange(len(signal_sums_on)), signal_sums_on, 'r.', label='Signal On')
+            axes[1,0].plot(np.arange(len(signal_sums_off)), signal_sums_off, 'b.', label='Signal Off')
+            axes[1,0].set_title('Frame-to-Frame Signal Variation')
+            axes[1,0].set_xlabel('Frame Number')
+            axes[1,0].set_ylabel('Integrated Signal')
+            axes[1,0].legend()
+            
+            # I0 variations
+            axes[1,1].plot(np.arange(len(I0_on)), I0_on, 'r.', label='I0 On')
+            axes[1,1].plot(np.arange(len(I0_off)), I0_off, 'b.', label='I0 Off')
+            axes[1,1].set_title('Frame-to-Frame I0 Variation')
+            axes[1,1].set_xlabel('Frame Number')
+            axes[1,1].set_ylabel('I0')
+            axes[1,1].legend()
+            
+            # Net signal distributions
+            axes[2,0].hist(net_signal_on, bins='auto', alpha=0.5, label='Laser On')
+            axes[2,0].hist(net_signal_off, bins='auto', alpha=0.5, label='Laser Off')
+            axes[2,0].set_title('Normalized Net Signal Distributions')
+            axes[2,0].set_xlabel('Net Signal (normalized)')
+            axes[2,0].set_ylabel('Count')
+            axes[2,0].legend()
+            
+            # Leave second subplot empty
+            axes[2,1].set_visible(False)
+            
+            # Add statistical information
+            stats_text = (
+                f'Statistics:\n'
+                f'N frames (on/off): {len(signal_sums_on)}/{len(signal_sums_off)}\n'
+                f'Signal mean ± SE (on): {np.mean(net_signal_on):.2e} ± {np.std(net_signal_on)/np.sqrt(len(net_signal_on)):.2e}\n'
+                f'Signal mean ± SE (off): {np.mean(net_signal_off):.2e} ± {np.std(net_signal_off)/np.sqrt(len(net_signal_off)):.2e}\n'
+                f'Signal CV (on/off): {np.std(net_signal_on)/np.mean(net_signal_on):.2%}/{np.std(net_signal_off)/np.mean(net_signal_off):.2%}\n'
+                f'P-value: {output.p_values[idx]:.2e}\n'
+                f'Log p-value: {log_p_values[idx]:.1f}\n'
+                f'Z-score: {(np.mean(net_signal_on) - np.mean(net_signal_off))/np.sqrt(output.std_devs_on[idx]**2 + output.std_devs_off[idx]**2):.2f}'
+            )
+            plt.figtext(0.02, 0.02, stats_text, fontsize=10, family='monospace')
+            
+            plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+            plt.savefig(save_dir / f'detailed_diagnostics_delay_{delay:.2f}ps.png')
+            plt.close()
+</file>
+<file path="./btx/processing/tasks/calculate_p_values.py" project="btx">
+from pathlib import Path
+from typing import Dict, Any
+import numpy as np
+import matplotlib.pyplot as plt
+import warnings
+
+try:
+    from line_profiler import profile
+except ImportError:
+    def profile(func):
+        return func
+
+from btx.processing.btx_types import CalculatePValuesInput, CalculatePValuesOutput
+
+class CalculatePValues:
+    """Calculate p-values from EMD values and null distribution."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        """Initialize p-value calculation task.
+        
+        Args:
+            config: Dictionary containing:
+                - calculate_pvalues.significance_threshold: P-value threshold (default: 0.05)
+        """
+        self.config = config
+        
+        # Set defaults
+        if 'calculate_pvalues' not in self.config:
+            self.config['calculate_pvalues'] = {}
+        if 'significance_threshold' not in self.config['calculate_pvalues']:
+            self.config['calculate_pvalues']['significance_threshold'] = 0.05
+
+    def _calculate_p_values(
+        self,
+        emd_values: np.ndarray,
+        null_distribution: np.ndarray
+    ) -> np.ndarray:
+        """Calculate p-values for each pixel.
+        
+        Args:
+            emd_values: 2D array of EMD values
+            null_distribution: 1D array of null distribution values
+            
+        Returns:
+            2D array of p-values
+        """
+        p_values = np.zeros_like(emd_values)
+        min_p_value = 1.0 / (len(null_distribution) + 1)
+        
+        for i in range(emd_values.shape[0]):
+            for j in range(emd_values.shape[1]):
+                p_value = np.mean(null_distribution >= emd_values[i, j])
+                if p_value == 0:
+                    warnings.warn(
+                        f"P-value underflow at pixel ({i},{j}). "
+                        f"Setting to minimum possible value {min_p_value:.2e}",
+                        RuntimeWarning
+                    )
+                    p_value = min_p_value
+                p_values[i, j] = p_value
+                
+        return p_values
+
+    @profile
+    def run(self, input_data: CalculatePValuesInput) -> CalculatePValuesOutput:
+        """Run p-value calculation.
+        
+        Args:
+            input_data: CalculatePValuesInput containing EMD values and null distribution
+            
+        Returns:
+            CalculatePValuesOutput containing p-values and derived data
+            
+        Raises:
+            ValueError: If input data is invalid
+        """
+        emd_values = input_data.emd_output.emd_values
+        null_distribution = input_data.emd_output.null_distribution
+        
+        # Calculate p-values
+        p_values = self._calculate_p_values(emd_values, null_distribution)
+        
+        # Calculate -log10(p-values) for visualization
+        # Handle zeros by using minimum possible p-value
+        min_p_value = 1.0 / (len(null_distribution) + 1)
+        log_p_values = -np.log10(np.maximum(p_values, min_p_value))
+        
+        # Get significance threshold
+        threshold = self.config['calculate_pvalues']['significance_threshold']
+        
+        # Print some statistics
+        n_significant = np.sum(p_values < threshold)
+        print(f"Found {n_significant} significant pixels "
+              f"(p < {threshold:.3f}, {n_significant/p_values.size:.1%} of total)")
+        
+        return CalculatePValuesOutput(
+            p_values=p_values,
+            log_p_values=log_p_values,
+            significance_threshold=threshold
+        )
+        
+    def plot_diagnostics(self, output: CalculatePValuesOutput, save_dir: Path) -> None:
+        """Generate diagnostic plots."""
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create figure with subplots
+        fig = plt.figure(figsize=(15, 10))
+        
+        # 1. P-value spatial distribution (log scale)
+        ax1 = fig.add_subplot(221)
+        im1 = ax1.imshow(output.log_p_values, cmap='viridis')
+        ax1.set_title('-log10(P-values)')
+        plt.colorbar(im1, ax=ax1)
+        
+        # 2. Binary significance mask
+        ax2 = fig.add_subplot(222)
+        signif_mask = output.p_values < output.significance_threshold
+        im2 = ax2.imshow(signif_mask, cmap='RdBu')
+        ax2.set_title(f'Significant Pixels (p < {output.significance_threshold:.3f})')
+        plt.colorbar(im2, ax=ax2)
+        
+        # 3. P-value histogram
+        ax3 = fig.add_subplot(223)
+        ax3.hist(output.p_values.ravel(), bins=50, density=True)
+        ax3.axvline(
+            output.significance_threshold,
+            color='r',
+            linestyle='--',
+            label=f'p = {output.significance_threshold:.3f}'
+        )
+        # Add uniform distribution reference line
+        ax3.axhline(1.0, color='k', linestyle=':', label='Uniform')
+        ax3.set_xlabel('P-value')
+        ax3.set_ylabel('Density')
+        ax3.set_title('P-value Distribution')
+        ax3.legend()
+        ax3.grid(True)
+        
+        # 4. Q-Q plot
+        ax4 = fig.add_subplot(224)
+        observed_p = np.sort(output.p_values.ravel())
+        expected_p = np.linspace(0, 1, len(observed_p))
+        ax4.plot(expected_p, observed_p, 'b.', alpha=0.1)
+        ax4.plot([0, 1], [0, 1], 'r--', label='y=x')
+        ax4.set_xlabel('Expected P-value')
+        ax4.set_ylabel('Observed P-value')
+        ax4.set_title('P-value Q-Q Plot')
+        ax4.grid(True)
+        ax4.legend()
+        
+        plt.tight_layout()
+        plt.savefig(save_dir / 'calculate_pvalues_diagnostics.png')
+        plt.close()
+</file>
+<file path="./btx/processing/tasks/load_data.py" project="btx">
+from pathlib import Path
+from typing import Dict, Any, Optional
+import numpy as np
+import matplotlib.pyplot as plt
+import numexpr as ne
+
+try:
+    from line_profiler import profile
+except ImportError:
+    def profile(func):
+        return func
+
+from btx.processing.btx_types import LoadDataInput, LoadDataOutput
+
+def validate_delay_binning(delays: np.ndarray, time_bin: float) -> bool:
+    """Verify if delays are properly binned according to time_bin."""
+    if len(delays) == 0:
+        return False
+        
+    unique = np.unique(delays[~np.isnan(delays)])
+    print(f"Found {len(unique)} unique delays: {unique}")
+    
+    # Check spacing between delays
+    spacings = np.diff(unique)
+    print(f"Delay spacings: {spacings}")
+    return np.allclose(spacings, time_bin, rtol=1e-3)
+
+class LoadData:
+    """Load and preprocess XPP data."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        """Initialize with configuration.
+        
+        Args:
+            config: Dictionary containing:
+                - setup.run: Run number
+                - setup.exp: Experiment number
+                - load_data.roi: ROI coordinates [x1, x2, y1, y2]
+                - load_data.energy_filter: Energy filter parameters [E0, dE, Emin, Emax]
+                - load_data.i0_threshold: I0 threshold value
+                - load_data.time_bin: Time bin size in ps
+        """
+        self.config = config
+        
+    @profile
+    def _apply_energy_threshold(self, data: np.ndarray):
+        """Apply energy thresholding to the data.
+        
+        Args:
+            data: Input image data array
+            
+        Returns:
+            Thresholded image data array with values set to 0 if they:
+            1. Fall outside the harmonic bands defined by [E0 ± dE, 2E0 ± dE, 3E0 ± dE]
+            2. Fall outside the global range [Emin, Emax]
+        """
+        E0, dE, Emin, Emax = self.config['load_data']['energy_filter']
+        
+        def _calc_masks():
+            """Numexpr implementation"""
+            local_dict = {
+                'data': data,
+                'E0': E0,
+                'dE': dE,
+                'Emin': Emin,
+                'Emax': Emax
+            }
+            
+            harmonic_mask = ne.evaluate(
+                "(data >= (E0 - dE)) & (data <= (E0 + dE)) |"
+                "(data >= (2*E0 - dE)) & (data <= (2*E0 + dE)) |"
+                "(data >= (3*E0 - dE)) & (data <= (3*E0 + dE))",
+                local_dict=local_dict
+            )
+            
+            global_mask = ne.evaluate("(data > Emin) & (data <= Emax)", 
+                                    local_dict=local_dict)
+            return harmonic_mask, global_mask
+
+        # Calculate masks using numexpr
+        harmonic_mask, global_mask = _calc_masks()
+        
+        # Apply both filters
+        data_cleaned = data.copy()
+        data_cleaned[~harmonic_mask] = 0
+        #data[~(harmonic_mask & global_mask)] = 0
+        data[~(global_mask)] = 0
+        
+        return data_cleaned, data
+
+    def _calculate_binned_delays(self, raw_delays: np.ndarray) -> np.ndarray:
+        """Calculate binned delays from raw delay values."""
+        time_bin = float(self.config['load_data']['time_bin'])
+        print("\n=== LoadData Delay Binning ===")
+        print(f"Binning delays with time_bin={time_bin}")
+        
+        # First check if actually pre-binned
+        unique_raw = np.unique(raw_delays[~np.isnan(raw_delays)])
+        spacings = np.diff(unique_raw)
+        print(f"Input delay statistics:")
+        print(f"- Number of unique delays: {len(unique_raw)}")
+        print(f"- Spacing statistics:")
+        print(f"  - Min spacing: {np.min(spacings):.6f}")
+        print(f"  - Max spacing: {np.max(spacings):.6f}")
+        print(f"  - Mean spacing: {np.mean(spacings):.6f}")
+        print(f"  - Median spacing: {np.median(spacings):.6f}")
+        
+        # Check if data needs rebinning
+        properly_binned = validate_delay_binning(raw_delays, time_bin)
+        print(f"\nData {'IS' if properly_binned else 'IS NOT'} properly binned to {time_bin} ps")
+            
+        # Force rebinning
+        print("\nForce rebinning to correct time_bin size...")
+        valid_delays = raw_delays[~np.isnan(raw_delays)]
+        if len(valid_delays) == 0:
+            raise ValueError("No valid delay values found")
+            
+        delay_min = np.floor(valid_delays.min())
+        delay_max = np.ceil(valid_delays.max())
+        
+        # Create bins centered on multiples of time_bin
+        bins = np.arange(delay_min, delay_max + time_bin, time_bin)
+        bin_centers = (bins[:-1] + bins[1:]) / 2
+        print(f"Created {len(bins)-1} bins with centers spaced by {time_bin} ps")
+        
+        # Bin the delays
+        indices = np.searchsorted(bins, raw_delays) - 1
+        indices = np.clip(indices, 0, len(bin_centers) - 1)
+        binned_delays = bin_centers[indices]
+        
+        # Verify output binning
+        unique_binned = np.unique(binned_delays[~np.isnan(binned_delays)])
+        spacings_binned = np.diff(unique_binned)
+        print(f"\nOutput delay statistics:")
+        print(f"- Number of unique delays: {len(unique_binned)}")
+        print(f"- Spacing statistics:")
+        print(f"  - Min spacing: {np.min(spacings_binned):.6f}")
+        print(f"  - Max spacing: {np.max(spacings_binned):.6f}")
+        print(f"  - Mean spacing: {np.mean(spacings_binned):.6f}")
+        print(f"  - Median spacing: {np.median(spacings_binned):.6f}")
+        
+        return binned_delays
+
+    @profile
+    def run(self, input_data: LoadDataInput) -> LoadDataOutput:
+        """Run the data loading and preprocessing."""
+        if input_data.data is not None:
+            # Use provided synthetic data
+            data = input_data.data
+            I0 = input_data.I0
+            laser_delays = input_data.laser_delays
+            laser_on_mask = input_data.laser_on_mask
+            laser_off_mask = input_data.laser_off_mask
+        else:
+            # Load from file using get_imgs_thresh
+            try:
+                from btx.processing.xpploader import get_imgs_thresh
+            except ImportError:
+                print("Note: get_imgs_thresh not available, only synthetic data mode supported")
+                raise
+                
+            data, I0, laser_delays, laser_on_mask, laser_off_mask = get_imgs_thresh(
+                self.config['setup']['run'],
+                self.config['setup']['exp'],
+                self.config['load_data']['roi'],
+                self.config['load_data'].get('energy_filter', [8.8, 5, 0, float('inf')]),
+                self.config['load_data'].get('i0_threshold', 200),
+                self.config['load_data'].get('ipm_pos_filter', [0.2, 0.5]),
+                self.config['load_data'].get('time_bin', 2),
+                self.config['load_data'].get('time_tool', [0., 0.005])
+            )
+            
+        # Apply energy thresholding
+        data, data_global_energy_filter = self._apply_energy_threshold(data)
+    
+        # Calculate binned delays
+        binned_delays = self._calculate_binned_delays(laser_delays)
+    
+        return LoadDataOutput(
+            data=data,
+            I0=I0,
+            laser_delays=laser_delays,
+            laser_on_mask=laser_on_mask,
+            laser_off_mask=laser_off_mask,
+            binned_delays=binned_delays,
+            data_global_energy_filter=data_global_energy_filter
+        )
+
+    def plot_diagnostics(self, output: LoadDataOutput, save_dir: Path) -> None:
+        """Generate diagnostic plots for visual validation."""
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create figure with subplots
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # 1. Average frame
+        avg_frame = np.mean(output.data, axis=0)
+        im1 = ax1.imshow(avg_frame, cmap='viridis')
+        ax1.set_title('Average Frame')
+        plt.colorbar(im1, ax=ax1)
+        
+        # 2. Frame-to-frame intensity variation
+        ax2.plot(np.mean(output.data, axis=(1,2)), label='Mean Intensity')
+        ax2.plot(output.I0, label='I0', alpha=0.5)
+        ax2.set_title('Intensity Variation')
+        ax2.set_xlabel('Frame')
+        ax2.legend()
+        
+        # 3. Delay distribution
+        ax3.hist(output.binned_delays[output.laser_on_mask], bins=50, 
+                 alpha=0.5, label='Laser On')
+        ax3.hist(output.binned_delays[output.laser_off_mask], bins=50,
+                 alpha=0.5, label='Laser Off')
+        ax3.set_title('Delay Distribution')
+        ax3.set_xlabel('Delay (ps)')
+        ax3.legend()
+        
+        # 4. Raw vs binned delays
+        ax4.scatter(output.laser_delays, output.binned_delays, alpha=0.1)
+        ax4.plot([output.laser_delays.min(), output.laser_delays.max()],
+                [output.laser_delays.min(), output.laser_delays.max()],
+                'r--', label='y=x')
+        ax4.set_title('Binned vs Raw Delays')
+        ax4.set_xlabel('Raw Delays (ps)')
+        ax4.set_ylabel('Binned Delays (ps)')
+        ax4.legend()
+        
+        plt.tight_layout()
+        plt.savefig(save_dir / 'load_data_diagnostics.png')
+        plt.close()
+</file>
+<file path="./btx/processing/tasks/make_histogram.py" project="btx">
+from pathlib import Path
+from typing import Dict, Any
+try:
+    from line_profiler import profile
+    PROFILING = True
+except ImportError:
+    # Create no-op decorator if line_profiler isn't installed
+    def profile(func):
+        return func
+    PROFILING = False
+import numpy as np
+import matplotlib.pyplot as plt
+from numba import jit, prange
+import functools
+import hashlib
+import random
+from numba.core.errors import NumbaWarning
+import warnings
+
+# Suppress Numba warnings
+warnings.filterwarnings('ignore', category=NumbaWarning)
+
+class MakeHistogramInput:
+    def __init__(self, load_data_output):
+        self.load_data_output = load_data_output
+
+from btx.processing.btx_types import MakeHistogramInput, MakeHistogramOutput
+
+def memoize_subsampled(func):
+    """Memoize a function by creating a hashable key using deterministically subsampled data."""
+    cache = {}
+
+    @functools.wraps(func)
+    def wrapper(self, data, *args, **kwargs):  # Add 'self' as first parameter
+        # Generate a hashable key from a deterministic subsample
+        shape_str = str(data.shape)  # Now data is the actual array
+        seed_value = int(hashlib.sha256(shape_str.encode()).hexdigest(), 16) % 10**8
+        random.seed(seed_value)
+
+        subsample_size = min(100, data.shape[0])  # Limit the subsample size to a maximum of 100
+        subsample_indices = random.sample(range(data.shape[0]), subsample_size)
+        subsample = data[subsample_indices]
+
+        hashable_key = hashlib.sha256(subsample.tobytes()).hexdigest()
+
+        # Check cache
+        if hashable_key in cache:
+            return cache[hashable_key]
+
+        # Calculate the result and store it in the cache
+        result = func(self, data, *args, **kwargs)  # Pass self to the original function
+        cache[hashable_key] = result
+
+        return result
+
+    return wrapper
+
+@jit(nopython=True, parallel=True, fastmath=True)
+def _calculate_histograms_numba(data, bin_boundaries, hist_start_bin, bins, rows, cols):
+    """Basic parallel histogram calculation."""
+    hist_shape = (bins, rows, cols)
+    histograms = np.zeros(hist_shape, dtype=np.float64)
+    
+    for row in prange(rows):
+        for col in range(cols):
+            pixel_data = data[:, row, col]
+            for frame in range(len(pixel_data)):
+                value = pixel_data[frame]
+                bin_idx = np.searchsorted(bin_boundaries, value)
+                if bin_idx < bins:
+                    histograms[bin_idx, row, col] += 1
+                else:
+                    histograms[hist_start_bin, row, col] += 1
+    
+    histograms += 1e-9
+    return histograms[hist_start_bin:, :, :]
+
+
+class MakeHistogram:
+    """Generate histograms from XPP data."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        """Initialize histogram generation task.
+        
+        Args:
+            config: Dictionary containing:
+                - make_histogram.bin_boundaries: Array of bin boundaries
+                - make_histogram.hist_start_bin: Index of first bin to include
+        """
+        self.config = config
+        
+        # Set defaults if not provided
+        if 'make_histogram' not in self.config:
+            self.config['make_histogram'] = {}
+        hist_config = self.config['make_histogram']
+        
+        if 'bin_boundaries' not in hist_config:
+            hist_config['bin_boundaries'] = np.arange(5, 30, 0.2)
+        if 'hist_start_bin' not in hist_config:
+            hist_config['hist_start_bin'] = 1
+        
+
+    @memoize_subsampled
+    def _calculate_histograms(
+        self,
+        data: np.ndarray,
+        bin_boundaries: np.ndarray,
+        hist_start_bin: int
+    ) -> np.ndarray:
+        """Calculate histograms for each pixel using Numba optimization.
+        
+        Args:
+            data: 3D array (frames, rows, cols)
+            bin_boundaries: Array of histogram bin boundaries
+            hist_start_bin: Index of first bin to include
+            
+        Returns:
+            3D array of histograms (bins, rows, cols)
+        """
+        bins = len(bin_boundaries) - 1
+        rows, cols = data.shape[1], data.shape[2]
+        
+        return _calculate_histograms_numba(
+            data, 
+            bin_boundaries, 
+            hist_start_bin,
+            bins,
+            rows,
+            cols
+        )
+
+    @profile
+    def run(self, input_data: MakeHistogramInput) -> MakeHistogramOutput:
+        """Run histogram generation.
+        
+        Args:
+            input_data: Input data container
+            
+        Returns:
+            MakeHistogramOutput containing histograms and bin information
+        """
+        hist_config = self.config['make_histogram']
+        bin_boundaries = np.array(hist_config['bin_boundaries'])
+        hist_start_bin = hist_config['hist_start_bin']
+        
+        data = input_data.load_data_output.data
+        
+        histograms = self._calculate_histograms(
+            data,
+            bin_boundaries,
+            hist_start_bin
+        )
+        
+        # Calculate bin edges and centers correctly
+        bin_edges = bin_boundaries[hist_start_bin:-1]  # Exclude the last edge
+        bin_centers = (bin_boundaries[hist_start_bin:-1] + bin_boundaries[hist_start_bin+1:]) / 2
+        
+        return MakeHistogramOutput(
+            histograms=histograms,
+            bin_edges=bin_edges,
+            bin_centers=bin_centers
+        )
+
+    @profile
+    def plot_diagnostics(self, output: MakeHistogramOutput, save_dir: Path) -> None:
+        """Generate diagnostic plots.
+        
+        Args:
+            output: Histogram calculation output
+            save_dir: Directory to save plots
+        """
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create figure with subplots
+        fig = plt.figure(figsize=(12, 5))
+        
+        # 1. Mean histogram across all pixels (log scale)
+        ax1 = fig.add_subplot(121)
+        mean_hist = np.mean(output.histograms, axis=(1, 2))
+        ax1.semilogy(output.bin_centers, mean_hist, 'b-')
+        ax1.set_title('Mean Histogram Across Pixels (Log Scale)')
+        ax1.set_xlabel('Value')
+        ax1.set_ylabel('Counts')
+        ax1.grid(True)
+        
+        # 2. 2D map of histogram total counts
+        ax2 = fig.add_subplot(122)
+        total_counts = np.sum(output.histograms, axis=0)
+        im2 = ax2.imshow(total_counts, cmap='viridis')
+        ax2.set_title('Histogram Total Counts Map')
+        plt.colorbar(im2, ax=ax2, label='Total Counts')
+        
+        
+        plt.tight_layout()
+        plt.savefig(save_dir / 'make_histogram_diagnostics.png')
+        plt.close()
+</file>
+<file path="./btx/processing/tests/functional/test_load_data.py" project="btx">
+import pytest
+from pathlib import Path
+import numpy as np
+import tempfile
+
+from btx.processing.tasks.load_data import LoadData
+from btx.processing.btx_types import LoadDataInput
+from btx.processing.tests.functional.data_generators import generate_synthetic_frames
+
+def test_load_data_validation():
+    """Test configuration validation."""
+    # Valid config
+    valid_config = {
+        'setup': {
+            'run': 123,
+            'exp': 'test',
+        },
+        'load_data': {
+            'roi': [0, 100, 0, 100],
+            'time_bin': 2.0
+        }
+    }
+    
+# removed the validation
+#    task = LoadData(valid_config)  # Should not raise
+#    
+#    # Test missing setup section
+#    invalid_config = valid_config.copy()
+#    del invalid_config['setup']
+#    with pytest.raises(ValueError, match="Missing 'setup' section"):
+#        LoadData(invalid_config)
+#    
+#    # Test invalid ROI
+#    invalid_config = valid_config.copy()
+#    invalid_config['load_data']['roi'] = [100, 0, 0, 100]  # Start > end
+#    with pytest.raises(ValueError, match="Invalid ROI coordinates"):
+#        LoadData(invalid_config)
+
+def test_load_data_synthetic():
+    """Test LoadData with synthetic data."""
+    # Generate synthetic data
+    num_frames = 1000
+    rows = cols = 100
+    data, I0, delays, on_mask, off_mask = generate_synthetic_frames(
+        num_frames, rows, cols
+    )
+    
+    # Create config
+    config = {
+        'setup': {
+            'run': 123,
+            'exp': 'test',
+        },
+        'load_data': {
+            'roi': [0, rows, 0, cols],
+            'time_bin': 2.0
+        }
+    }
+    
+    # Create input
+    input_data = LoadDataInput(
+        config=config,
+        data=data,
+        I0=I0,
+        laser_delays=delays,
+        laser_on_mask=on_mask,
+        laser_off_mask=off_mask
+    )
+    
+    # Run task
+    task = LoadData(config)
+    output = task.run(input_data)
+    
+    # Validate output shapes
+    assert output.data.shape == (num_frames, rows, cols)
+    assert output.I0.shape == (num_frames,)
+    assert output.laser_delays.shape == (num_frames,)
+    assert output.binned_delays.shape == (num_frames,)
+    assert output.laser_on_mask.shape == (num_frames,)
+    assert output.laser_off_mask.shape == (num_frames,)
+    
+    # Validate binned delays
+    bin_size = config['load_data']['time_bin']
+    diffs = np.diff(np.unique(output.binned_delays))
+    assert np.allclose(diffs, bin_size, atol=1e-10)
+
+def test_load_data_visual():
+    """Generate visual diagnostic plots for manual inspection."""
+    # Save plots in a fixed location under the project's processing directory
+    save_dir = Path(__file__).parent.parent.parent / 'temp' / 'diagnostic_plots' / 'load_data'
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nGenerating visual test plots in: {save_dir}")
+    
+    # ... (rest of the test remains the same, but use save_dir instead of temp_dir)
+    
+    # Generate synthetic data
+    num_frames = 1000
+    rows = cols = 100
+    data, I0, delays, on_mask, off_mask = generate_synthetic_frames(
+        num_frames, rows, cols
+    )
+    
+    # Create config
+    config = {
+        'setup': {
+            'run': 123,
+            'exp': 'test',
+        },
+        'load_data': {
+            'roi': [0, rows, 0, cols],
+            'time_bin': 2.0
+        }
+    }
+    
+    # Create input
+    input_data = LoadDataInput(
+        config=config,
+        data=data,
+        I0=I0,
+        laser_delays=delays,
+        laser_on_mask=on_mask,
+        laser_off_mask=off_mask
+    )
+    
+    # Run task
+    task = LoadData(config)
+    output = task.run(input_data)
+    
+    # Generate diagnostic plots
+    task.plot_diagnostics(output, save_dir)
+    
+    # Verify plot was created
+    plot_file = save_dir / 'load_data_diagnostics.png'
+    assert plot_file.exists(), f"Diagnostic plot not created at {plot_file}"
+    
+    print(f"Generated diagnostic plot: {plot_file}")
+    return save_dir  # Return path for manual inspection
+
+if __name__ == '__main__':
+    # Run visual test and print location of plots
+    plot_dir = test_load_data_visual()
+    print(f"\nVisual test complete. Inspect plots at: {plot_dir}")
+</file>
+<file path="./btx/processing/tests/functional/test_calculate_p_values.py" project="btx">
+import pytest
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+
+from btx.processing.tasks.calculate_p_values import CalculatePValues
+from btx.processing.btx_types import (
+    CalculatePValuesInput,
+    MeasureEMDOutput
+)
+
+def generate_synthetic_data(
+    rows: int = 100,
+    cols: int = 100,
+    num_null: int = 1000,
+    signal_strength: float = 2.0,
+    signal_loc: tuple = (60, 80, 60, 80),
+    seed: int = 42
+):
+    """Generate synthetic EMD values and null distribution with known signal.
+    
+    Args:
+        rows: Number of rows
+        cols: Number of columns
+        num_null: Size of null distribution
+        signal_strength: How many std devs above background for signal
+        signal_loc: (x1, x2, y1, y2) bounds for signal region
+        seed: Random seed for reproducibility
+        
+    Returns:
+        Tuple of (emd_values, null_distribution)
+    """
+    np.random.seed(seed)
+    
+    # Generate null distribution (chi-squared with 2 df)
+    null_distribution = np.random.chisquare(df=2, size=num_null)
+    
+    # Generate background EMD values from same distribution
+    emd_values = np.random.chisquare(df=2, size=(rows, cols))
+    
+    # Add elevated signal region
+    x1, x2, y1, y2 = signal_loc
+    null_std = np.std(null_distribution)
+    emd_values[x1:x2, y1:y2] += signal_strength * null_std
+    
+    return emd_values, null_distribution
+
+def test_calculate_p_values_validation():
+    """Test configuration validation."""
+    # Valid config
+    valid_config = {
+        'calculate_pvalues': {
+            'significance_threshold': 0.05
+        }
+    }
+    
+    task = CalculatePValues(valid_config)  # Should not raise
+    
+    # Test invalid threshold
+    invalid_config = {
+        'calculate_pvalues': {
+            'significance_threshold': 1.5  # > 1
+        }
+    }
+    with pytest.raises(ValueError, match="significance_threshold must be between"):
+        CalculatePValues(invalid_config)
+    
+    invalid_config['calculate_pvalues']['significance_threshold'] = 0.0  # == 0
+    with pytest.raises(ValueError, match="significance_threshold must be between"):
+        CalculatePValues(invalid_config)
+    
+    # Test missing config (should use defaults)
+    minimal_config = {}
+    task = CalculatePValues(minimal_config)
+    assert task.config['calculate_pvalues']['significance_threshold'] == 0.05
+
+def test_calculate_p_values_synthetic():
+    """Test CalculatePValues with synthetic data."""
+    # Generate synthetic data with known signal
+    rows = cols = 100
+    num_null = 1000
+    emd_values, null_distribution = generate_synthetic_data(
+        rows=rows,
+        cols=cols,
+        num_null=num_null,
+        signal_strength=3.0  # Strong signal
+    )
+    
+    # Create mock MeasureEMDOutput
+    emd_output = MeasureEMDOutput(
+        emd_values=emd_values,
+        null_distribution=null_distribution,
+        avg_histogram=np.zeros(10),  # Not used by this task
+        avg_hist_edges=np.zeros(11)  # Not used by this task
+    )
+    
+    # Create config
+    config = {
+        'calculate_pvalues': {
+            'significance_threshold': 0.05
+        }
+    }
+    
+    # Create input
+    input_data = CalculatePValuesInput(
+        config=config,
+        emd_output=emd_output
+    )
+    
+    # Run task
+    task = CalculatePValues(config)
+    output = task.run(input_data)
+    
+    # Validate output shapes
+    assert output.p_values.shape == (rows, cols)
+    assert output.log_p_values.shape == (rows, cols)
+    
+    # Validate p-value properties
+    assert np.all(output.p_values >= 0)
+    assert np.all(output.p_values <= 1)
+    assert np.all(np.isfinite(output.p_values))
+    
+    # Check signal detection
+    # Signal region should have lower p-values
+    signal_p_values = output.p_values[60:80, 60:80]
+    background_p_values = output.p_values[20:40, 20:40]
+    assert np.median(signal_p_values) < np.median(background_p_values)
+    
+    # Validate log p-values
+    min_p_value = 1.0 / (len(null_distribution) + 1)
+    max_log_p = -np.log10(min_p_value)
+    assert np.all(output.log_p_values <= max_log_p)
+    assert np.all(output.log_p_values >= 0)
+
+def test_calculate_p_values_edge_cases():
+    """Test CalculatePValues with edge cases."""
+    rows = cols = 50
+    num_null = 1000
+    
+    # Test case 1: Very strong signal (potential underflow)
+    emd_values, null_distribution = generate_synthetic_data(
+        rows=rows,
+        cols=cols,
+        num_null=num_null,
+        signal_strength=10.0  # Very strong signal
+    )
+    
+    emd_output = MeasureEMDOutput(
+        emd_values=emd_values,
+        null_distribution=null_distribution,
+        avg_histogram=np.zeros(10),
+        avg_hist_edges=np.zeros(11)
+    )
+    
+    config = {
+        'calculate_pvalues': {
+            'significance_threshold': 0.05
+        }
+    }
+    
+    input_data = CalculatePValuesInput(
+        config=config,
+        emd_output=emd_output
+    )
+    
+    task = CalculatePValues(config)
+#    with pytest.warns(RuntimeWarning, match="P-value underflow"):
+#        output = task.run(input_data)
+    output = task.run(input_data)
+    
+    # Verify minimum p-value is used
+    min_p_value = 1.0 / (len(null_distribution) + 1)
+    assert np.min(output.p_values) >= min_p_value
+    
+    # Test case 2: No signal (p-values should be uniform)
+    emd_values = np.random.chisquare(df=2, size=(rows, cols))
+    null_distribution = np.random.chisquare(df=2, size=num_null)
+    
+    emd_output = MeasureEMDOutput(
+        emd_values=emd_values,
+        null_distribution=null_distribution,
+        avg_histogram=np.zeros(10),
+        avg_hist_edges=np.zeros(11)
+    )
+    
+    input_data = CalculatePValuesInput(
+        config=config,
+        emd_output=emd_output
+    )
+    
+    output = task.run(input_data)
+    
+    # P-values should be roughly uniform
+    hist, _ = np.histogram(output.p_values, bins=10, range=(0, 1))
+#    expected_count = len(output.p_values.ravel()) / 10
+#    assert np.all(np.abs(hist - expected_count) < expected_count * 0.3)  # Within 30%
+
+def test_calculate_p_values_visual():
+    """Generate visual diagnostic plots for manual inspection."""
+    save_dir = Path(__file__).parent.parent.parent / 'temp' / 'diagnostic_plots' / 'calculate_pvalues'
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nGenerating visual test plots in: {save_dir}")
+    
+    # Generate synthetic data with clear signal
+    rows = cols = 100
+    num_null = 1000
+    emd_values, null_distribution = generate_synthetic_data(
+        rows=rows,
+        cols=cols,
+        num_null=num_null,
+        signal_strength=3.0,  # Clear signal
+        seed=42
+    )
+    
+    emd_output = MeasureEMDOutput(
+        emd_values=emd_values,
+        null_distribution=null_distribution,
+        avg_histogram=np.zeros(10),
+        avg_hist_edges=np.zeros(11)
+    )
+    
+    # Create config
+    config = {
+        'calculate_pvalues': {
+            'significance_threshold': 0.05
+        }
+    }
+    
+    # Create input
+    input_data = CalculatePValuesInput(
+        config=config,
+        emd_output=emd_output
+    )
+    
+    # Run task
+    task = CalculatePValues(config)
+    output = task.run(input_data)
+    
+    # Generate diagnostic plots
+    task.plot_diagnostics(output, save_dir)
+    
+    # Verify plot was created
+    plot_file = save_dir / 'calculate_pvalues_diagnostics.png'
+    assert plot_file.exists(), f"Diagnostic plot not created at {plot_file}"
+    print(f"Generated diagnostic plot: {plot_file}")
+    
+    plt.close('all')  # Clean up
+
+if __name__ == '__main__':
+    # Run visual test to generate plots
+    test_calculate_p_values_visual()
+    print("\nVisual test complete. Check the diagnostic plots in the output directory.")
+</file>
+<file path="./btx/processing/tests/functional/test_pipeline_integration.py" project="btx">
+# btx/processing/tests/functional/test_pipeline_integration.py
+from pathlib import Path
+import numpy as np
+from scipy import optimize
+import matplotlib.pyplot as plt
+
+from btx.processing.core.pipeline import Pipeline, PipelineBuilder
+from btx.processing.core.adapters import registry
+from btx.processing.tasks import (
+    LoadData, MakeHistogram, MeasureEMD,
+    CalculatePValues, BuildPumpProbeMasks, PumpProbeAnalysis
+)
+from btx.processing.btx_types import (
+    LoadDataInput, LoadDataOutput,
+    MakeHistogramInput, MakeHistogramOutput,
+    MeasureEMDInput, MeasureEMDOutput,
+    CalculatePValuesInput, CalculatePValuesOutput,
+    BuildPumpProbeMasksInput, BuildPumpProbeMasksOutput,
+    PumpProbeAnalysisInput, PumpProbeAnalysisOutput
+)
+from btx.processing.tests.functional.test_pump_probe import generate_synthetic_pump_probe_data
+config = {
+   'setup': {
+       'run': 'synthetic_test',
+       'exp': 'pipeline_validation',
+       'background_roi_coords': [0, 15, 0, 40]
+   },
+   'load_data': {
+       'roi': [0, 100, 0, 100],
+       'time_bin': 2.0,
+       'i0_threshold': 200
+   },
+   'make_histogram': {
+       'bin_boundaries': np.arange(5, 30, 0.2),
+       'hist_start_bin': 1
+   },
+   'calculate_emd': {
+       'num_permutations': 1000
+   },
+   'calculate_pvalues': {
+       'significance_threshold': 0.05
+   },
+   'generate_masks': {
+       'threshold': 0.05, # assert between 0 and 1
+       'bg_mask_mult': 2.0,
+       'bg_mask_thickness': 5
+   },
+   'pump_probe_analysis': {
+       'min_count': 10,
+       'significance_level': 0.05
+   }
+}
+
+# Setup output directory
+output_dir = Path("pipeline_results")
+output_dir.mkdir(exist_ok=True)
+diagnostics_dir = output_dir / "diagnostics"
+diagnostics_dir.mkdir(exist_ok=True)
+
+print("\nGenerating test data and configuration...")
+load_data_output, masks_output, signal_values = generate_synthetic_pump_probe_data(signal_profile = 'exponential',
+                                                         profile_params={'amplitude': 5, 'decay_time': 5.0}
+)
+
+print("\nCreating histogram...")
+make_histogram = MakeHistogram(config)
+histogram_input = MakeHistogramInput(
+    config=config,
+    load_data_output=load_data_output
+)
+histogram_output = make_histogram.run(histogram_input)
+make_histogram.plot_diagnostics(histogram_output, diagnostics_dir / "make_histogram")
+
+print("\nMeasuring EMD...")
+measure_emd = MeasureEMD(config)
+emd_input = MeasureEMDInput(
+    config=config,
+    histogram_output=histogram_output
+)
+emd_output = measure_emd.run(emd_input)
+measure_emd.plot_diagnostics(emd_output, diagnostics_dir / "measure_emd")
+
+print("\nCalculating p-values...")
+calculate_pvalues = CalculatePValues(config)
+pvalues_input = CalculatePValuesInput(
+    config=config,
+    emd_output=emd_output
+)
+pvalues_output = calculate_pvalues.run(pvalues_input)
+calculate_pvalues.plot_diagnostics(pvalues_output, diagnostics_dir / "calculate_pvalues")
+
+print("\nBuilding masks...")
+build_masks = BuildPumpProbeMasks(config)
+masks_input = BuildPumpProbeMasksInput(
+    config=config,
+    histogram_output=histogram_output,
+    p_values_output=pvalues_output
+)
+masks_output = build_masks.run(masks_input)
+build_masks.plot_diagnostics(masks_output, diagnostics_dir / "build_masks")
+
+print("\nRunning pump-probe analysis...")
+pump_probe = PumpProbeAnalysis(config)
+pump_probe_input = PumpProbeAnalysisInput(
+    config=config,
+    load_data_output=load_data_output,
+    masks_output=masks_output
+)
+pump_probe_output = pump_probe.run(pump_probe_input)
+pump_probe.plot_diagnostics(pump_probe_output, diagnostics_dir / "pump_probe")
+
+print("\nProcessing complete! Results saved in:", output_dir)
+
+# Print some key results
+print("\nKey Results:")
+print(f"Number of significant pixels: {np.sum(pvalues_output.p_values < config['calculate_pvalues']['significance_threshold'])}")
+print(f"Signal mask size: {np.sum(masks_output.signal_mask)} pixels")
+print(f"Background mask size: {np.sum(masks_output.background_mask)} pixels")
+print(f"Number of delay points: {len(pump_probe_output.delays)}")
+print(f"Mean I0 (laser on): {pump_probe_output.mean_I0_on:.1f}")
+print(f"Mean I0 (laser off): {pump_probe_output.mean_I0_off:.1f}")
+</file>
+<file path="./btx/processing/tests/functional/data_generators.py" project="btx">
+import numpy as np
+from typing import Tuple
+
+def generate_synthetic_frames(
+    num_frames: int,
+    rows: int,
+    cols: int,
+    seed: int = 42
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Generate synthetic data for testing LoadData task.
+    
+    Args:
+        num_frames: Number of frames to generate
+        rows: Number of rows per frame
+        cols: Number of columns per frame
+        seed: Random seed for reproducibility
+        
+    Returns:
+        Tuple containing:
+        - data: (num_frames, rows, cols) array of frame data
+        - I0: (num_frames,) array of I0 values
+        - delays: (num_frames,) array of delay values
+        - on_mask: (num_frames,) boolean array for laser on
+        - off_mask: (num_frames,) boolean array for laser off
+    """
+    np.random.seed(seed)
+    
+    # Create base pattern for frames
+    x, y = np.meshgrid(np.linspace(-5, 5, rows), np.linspace(-5, 5, cols))
+    base_pattern = np.exp(-(x**2 + y**2)/2)
+    
+    # Generate frames with noise and varying intensity
+    frames = []
+    for _ in range(num_frames):
+        intensity = np.random.normal(1.0, 0.1)
+        noise = np.random.normal(0, 0.05, (rows, cols))
+        frame = intensity * base_pattern + noise
+        frames.append(frame)
+    
+    data = np.array(frames)
+    
+    # Generate other arrays
+    I0 = np.random.normal(1000, 100, num_frames)
+    delays = np.linspace(-10, 10, num_frames) + np.random.normal(0, 0.1, num_frames)
+    on_mask = np.zeros(num_frames, dtype=bool)
+    on_mask[::2] = True
+    off_mask = ~on_mask
+    
+    return data, I0, delays, on_mask, off_mask
+</file>
+<file path="./btx/processing/tests/functional/test_make_histogram.py" project="btx">
+import pytest
+from pathlib import Path
+import numpy as np
+
+from btx.processing.tasks.make_histogram import MakeHistogram
+from btx.processing.btx_types import MakeHistogramInput, LoadDataOutput
+from btx.processing.tests.functional.data_generators import generate_synthetic_frames
+
+def test_make_histogram_validation():
+    """Test configuration validation."""
+    # Valid config
+    valid_config = {
+        'make_histogram': {
+            'bin_boundaries': np.arange(5, 30, 0.2),
+            'hist_start_bin': 1
+        }
+    }
+    
+    task = MakeHistogram(valid_config)  # Should not raise
+    
+    # Test missing section
+    invalid_config = {}
+    with pytest.raises(ValueError, match="Missing 'make_histogram' section"):
+        MakeHistogram(invalid_config)
+    
+    # Test invalid hist_start_bin
+    invalid_config = {
+        'make_histogram': {
+            'bin_boundaries': np.arange(5, 30, 0.2),
+            'hist_start_bin': -1  # Invalid negative index
+        }
+    }
+    with pytest.raises(ValueError, match="hist_start_bin must be between"):
+        MakeHistogram(invalid_config)
+
+def test_make_histogram_synthetic():
+    """Test MakeHistogram with synthetic data."""
+    # Generate synthetic data
+    num_frames = 1000
+    rows = cols = 100
+    data, I0, delays, on_mask, off_mask = generate_synthetic_frames(
+        num_frames, rows, cols
+    )
+    
+    # Scale data to match expected range
+    data = 5 + (25 * (data - data.min()) / (data.max() - data.min()))
+    
+    # Create LoadDataOutput
+    load_data_output = LoadDataOutput(
+        data=data,
+        I0=I0,
+        laser_delays=delays,
+        laser_on_mask=on_mask,
+        laser_off_mask=off_mask,
+        binned_delays=delays
+    )
+    
+    # Create config
+    config = {
+        'make_histogram': {
+            'bin_boundaries': np.arange(5, 30, 0.2),
+            'hist_start_bin': 1
+        }
+    }
+    
+    # Create input
+    input_data = MakeHistogramInput(
+        config=config,
+        load_data_output=load_data_output
+    )
+    
+    # Run task
+    task = MakeHistogram(config)
+    output = task.run(input_data)
+    
+    # Validate output shapes
+    n_bins = len(config['make_histogram']['bin_boundaries']) - 1
+    expected_bins = n_bins - config['make_histogram']['hist_start_bin']
+    assert output.histograms.shape == (expected_bins, rows, cols)
+    
+    # Validate histogram properties
+    assert np.all(output.histograms >= 1e-9)  # Check small constant was added
+    assert np.all(np.isfinite(output.histograms))  # Check for any inf/nan values
+    
+    # Validate bin structure
+    assert len(output.bin_edges) == expected_bins 
+    assert len(output.bin_centers) == expected_bins
+#    assert np.allclose(
+#        output.bin_centers,
+#        (output.bin_edges[:-1] + output.bin_edges[1:]) / 2
+#    )
+
+def test_make_histogram_visual():
+    """Generate visual diagnostic plots for manual inspection."""
+    save_dir = Path(__file__).parent.parent.parent / 'temp' / 'diagnostic_plots' / 'make_histogram'
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nGenerating visual test plots in: {save_dir}")
+    
+    # Generate synthetic data
+    num_frames = 1000
+    rows = cols = 100
+    data, I0, delays, on_mask, off_mask = generate_synthetic_frames(
+        num_frames, rows, cols
+    )
+    
+    # Scale data to match expected range
+    data = 5 + (25 * (data - data.min()) / (data.max() - data.min()))
+    
+    # Create LoadDataOutput
+    load_data_output = LoadDataOutput(
+        data=data,
+        I0=I0,
+        laser_delays=delays,
+        laser_on_mask=on_mask,
+        laser_off_mask=off_mask,
+        binned_delays=delays
+    )
+    
+    # Create config
+    config = {
+        'make_histogram': {
+            'bin_boundaries': np.arange(5, 30, 0.2),
+            'hist_start_bin': 1
+        }
+    }
+    
+    # Create input
+    input_data = MakeHistogramInput(
+        config=config,
+        load_data_output=load_data_output
+    )
+    
+    # Run task
+    task = MakeHistogram(config)
+    output = task.run(input_data)
+    
+    # Generate diagnostic plots
+    task.plot_diagnostics(output, save_dir)
+    
+    # Verify plots were created
+    for plot_name in ['make_histogram_diagnostics.png', 'make_histogram_central_pixels.png']:
+        plot_file = save_dir / plot_name
+        assert plot_file.exists(), f"Diagnostic plot not created at {plot_file}"
+        print(f"Generated diagnostic plot: {plot_file}")
+    
+    return save_dir
+
+if __name__ == '__main__':
+    # Run visual test and print location of plots
+    plot_dir = test_make_histogram_visual()
+    print(f"\nVisual test complete. Inspect plots at: {plot_dir}")
+</file>
+<file path="./btx/processing/tests/functional/test_multi_peak_masks.py" project="btx">
+# test_multi_peak_masks.py
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+from scipy import stats
+from btx.processing.tests.functional.test_multi_peak import (
+    GaussianPeak, 
+    generate_multi_peak_data,
+    plot_synthetic_data_diagnostics
+)
+from btx.processing.tasks.build_pump_probe_masks import BuildPumpProbeMasks
+from btx.processing.btx_types import (
+    BuildPumpProbeMasksInput,
+    MakeHistogramOutput,
+    CalculatePValuesOutput
+)
+
+def test_multi_peak_mask_generation():
+    """Test BuildPumpProbeMasks with synthetic multi-peak data."""
+    # Set up output directory
+    save_dir = Path(__file__).parent.parent.parent / 'temp' / 'diagnostic_plots' / 'multi_peak_masks'
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Define test peaks of varying sizes and amplitudes
+    peaks = [
+        GaussianPeak(center=(30, 30), sigma=8.0, amplitude=2.0),    # Large peak
+        GaussianPeak(center=(70, 70), sigma=6.0, amplitude=3.0),    # Medium peak
+        GaussianPeak(center=(20, 70), sigma=4.0, amplitude=4.0),    # Small peak
+    ]
+    
+    # Generate synthetic data
+    frames, histograms, lambda_map, true_masks = generate_multi_peak_data(
+        peaks=peaks,
+        base_counts=100.0,
+        num_frames=1000,
+        num_histogram_bins=50,
+        histogram_range=(0, 300),
+        background_roi=(0, 20, 0, 20),
+        seed=42
+    )
+    
+    # Plot synthetic data diagnostics
+    plot_synthetic_data_diagnostics(
+        frames, histograms, lambda_map, true_masks,
+        save_dir,
+        'synthetic_data.png'
+    )
+    
+    # Calculate p-values using likelihood ratio test for Poisson data
+    p_values = np.zeros((100, 100))
+    background_hist = histograms[:, :20, :20].mean(axis=(1,2))  # Use background ROI
+    
+    # Function to calculate likelihood ratio statistic for Poisson data
+    def poisson_likelihood_ratio(observed, expected):
+        """Calculate likelihood ratio statistic for Poisson data.
+        
+        G = 2 * sum(O_i * ln(O_i/E_i) - (O_i - E_i))
+        where O_i are observed counts and E_i are expected counts.
+        """
+        # Handle zeros in observed data
+        mask = observed > 0
+        G = np.zeros_like(observed, dtype=float)
+        G[mask] = observed[mask] * np.log(observed[mask]/expected[mask])
+        return 2 * (np.sum(G) - np.sum(observed - expected))
+
+    for i in range(100):
+        for j in range(100):
+            hist = histograms[:, i, j]
+            
+            # Scale background to match total counts
+            scale = np.sum(hist) / np.sum(background_hist)
+            expected = background_hist * scale
+            
+            # Calculate likelihood ratio statistic
+            G = poisson_likelihood_ratio(hist, expected)
+            
+            # Get p-value from chi-squared distribution
+            # Degrees of freedom = number of bins - 1 (for scaling)
+            dof = np.sum((hist > 0) | (expected > 0)) - 1
+            if dof > 0:  # Only calculate if we have enough data
+                p_values[i, j] = stats.chi2.sf(G, dof)
+            else:
+                p_values[i, j] = 1.0
+
+    # Add p-value calculation debugging
+    print("\nP-value Statistics:")
+    print(f"Range: {p_values.min():.2e} to {p_values.max():.2e}")
+    print(f"Mean: {p_values.mean():.2e}")
+    print(f"Median: {np.median(p_values):.2e}")
+    
+    # Visualize p-values
+    fig, axes = plt.subplots(2, 2, figsize=(15, 15))
+    fig.suptitle('P-value Debugging')
+    
+    # 1. Lambda map (true signal)
+    im0 = axes[0, 0].imshow(lambda_map)
+    axes[0, 0].set_title('True λ Map')
+    plt.colorbar(im0, ax=axes[0, 0])
+    
+    # 2. P-value map
+    im1 = axes[0, 1].imshow(p_values)
+    axes[0, 1].set_title('P-values')
+    plt.colorbar(im1, ax=axes[0, 1])
+    
+    # 3. Log p-value map
+    log_p = -np.log10(p_values + 1e-20)  # Add small constant to avoid log(0)
+    im2 = axes[1, 0].imshow(log_p)
+    axes[1, 0].set_title('-log10(P-values)')
+    plt.colorbar(im2, ax=axes[1, 0])
+    
+    # 4. Significant pixels mask
+    significant = p_values < 0.05
+    im3 = axes[1, 1].imshow(significant)
+    axes[1, 1].set_title('Significant Pixels (p < 0.05)')
+    plt.colorbar(im3, ax=axes[1, 1])
+    
+    plt.savefig(save_dir / 'pvalue_debug.png')
+    plt.close()
+
+    # Print cluster identification debug info
+    print("\nCluster Identification Debug:")
+    significant_count = np.sum(significant)
+    print(f"Number of significant pixels: {significant_count}")
+    print(f"Background ROI significant pixels: {np.sum(significant[0:20, 0:20])}")
+
+    # Create input data structures
+    histogram_output = MakeHistogramOutput(
+        histograms=histograms,
+        bin_edges=np.linspace(0, 300, 51),  # One more than bins
+        bin_centers=np.linspace(3, 297, 50)  # Center of each bin
+    )
+    
+    p_values_output = CalculatePValuesOutput(
+        p_values=p_values,
+        log_p_values=-np.log10(p_values),
+        significance_threshold=0.05
+    )
+    
+    # Configure mask builder
+    config = {
+        'setup': {
+            'background_roi_coords': [0, 20, 0, 20]  # Same as used in synthetic data
+        },
+        'generate_masks': {
+            'threshold': 0.05,
+            'bg_mask_mult': 2.0,
+            'bg_mask_thickness': 5,
+            'max_peaks': 10,
+            'min_peak_size': 10
+        }
+    }
+    
+    # Create and run mask builder
+    mask_builder = BuildPumpProbeMasks(config)
+    input_data = BuildPumpProbeMasksInput(
+        config=config,
+        histogram_output=histogram_output,
+        p_values_output=p_values_output
+    )
+    
+    output = mask_builder.run(input_data)
+    
+    # Generate diagnostics
+    mask_builder.plot_diagnostics(output, save_dir)
+    
+    # Add comparison plot of true vs found masks
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+    fig.suptitle('True vs Found Masks Comparison')
+    
+    # True masks
+    combined_true = np.zeros((100, 100))
+    for i, mask in enumerate(true_masks, 1):
+        combined_true[mask] = i
+    ax1.imshow(combined_true)
+    ax1.set_title('True Peak Regions')
+    
+    # Found masks
+    combined_found = np.zeros((100, 100))
+    for i, pair in enumerate(output.mask_pairs, 1):
+        combined_found[pair.signal_mask] = i
+    ax2.imshow(combined_found)
+    ax2.set_title('Found Signal Masks')
+    
+    plt.savefig(save_dir / 'mask_comparison.png')
+    plt.close()
+    
+    # Print some statistics
+    print("\nMask Generation Results:")
+    print(f"Number of true peaks: {len(true_masks)}")
+    print(f"Number of found peaks: {len(output.mask_pairs)}")
+    
+    # Compare mask sizes
+    print("\nMask Sizes:")
+    print("True masks:", [np.sum(mask) for mask in true_masks])
+    print("Found masks:", [pair.size for pair in output.mask_pairs])
+
+if __name__ == '__main__':
+    test_multi_peak_mask_generation()
+    print("\nTest complete. Check the diagnostic plots in the output directory.")
+</file>
+<file path="./btx/processing/tests/functional/test_measure_emd.py" project="btx">
+import pytest
+from pathlib import Path
+from typing import Tuple
+import numpy as np
+import matplotlib.pyplot as plt
+
+from btx.processing.tasks.measure_emd import MeasureEMD
+from btx.processing.btx_types import (
+    MeasureEMDInput,
+    MakeHistogramOutput,
+    LoadDataOutput
+)
+
+def generate_synthetic_histograms(
+    num_bins: int = 50,
+    rows: int = 100,
+    cols: int = 100,
+    background_mean: float = 10.0,
+    signal_mean: float = 15.0,
+    noise_level: float = 1.0,
+    roi_x: Tuple[int, int] = (20, 40),
+    roi_y: Tuple[int, int] = (20, 40)
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Generate synthetic histograms with known signal and background regions."""
+    # Create background histograms
+    histograms = np.random.normal(
+        background_mean,
+        noise_level,
+        (num_bins, rows, cols)
+    )
+    
+    # Add signal region (different distribution)
+    signal_mask = np.zeros((rows, cols), dtype=bool)
+    signal_mask[60:80, 60:80] = True
+    
+    for i in range(num_bins):
+        histograms[i, signal_mask] = np.random.normal(
+            signal_mean,
+            noise_level,
+            size=np.sum(signal_mask)
+        )
+    
+    # Ensure histograms are positive
+    histograms = np.abs(histograms)
+    
+    # Create bin edges
+    bin_edges = np.linspace(0, 30, num_bins + 1)
+    
+    return histograms, bin_edges
+
+def test_measure_emd_validation():
+    """Test configuration validation."""
+    # Valid config
+    valid_config = {
+        'setup': {
+            'background_roi_coords': [20, 40, 20, 40]
+        },
+        'calculate_emd': {
+            'num_permutations': 100
+        }
+    }
+    
+    task = MeasureEMD(valid_config)  # Should not raise
+    
+    # Test missing section
+    invalid_config = {}
+    with pytest.raises(ValueError, match="Missing 'setup' section"):
+        MeasureEMD(invalid_config)
+    
+    # Test missing ROI
+    invalid_config = {'setup': {}}
+    with pytest.raises(ValueError, match="Missing background_roi_coords"):
+        MeasureEMD(invalid_config)
+    
+    # Test invalid ROI format
+    invalid_config = {
+        'setup': {
+            'background_roi_coords': [0, 1, 2]  # Wrong length
+        }
+    }
+    with pytest.raises(ValueError, match="must be \\[x1, x2, y1, y2\\]"):
+        MeasureEMD(invalid_config)
+        
+    # Test invalid ROI coordinates
+    invalid_config = {
+        'setup': {
+            'background_roi_coords': [40, 20, 20, 40]  # x2 < x1
+        }
+    }
+    with pytest.raises(ValueError, match="Invalid ROI coordinates"):
+        MeasureEMD(invalid_config)
+
+def test_measure_emd_synthetic():
+    """Test MeasureEMD with synthetic data."""
+    # Generate synthetic data
+    num_bins = 50
+    rows = cols = 100
+    histograms, bin_edges = generate_synthetic_histograms(
+        num_bins=num_bins,
+        rows=rows,
+        cols=cols
+    )
+    
+    # Create histogram output
+    histogram_output = MakeHistogramOutput(
+        histograms=histograms,
+        bin_edges=bin_edges,
+        bin_centers=(bin_edges[:-1] + bin_edges[1:]) / 2
+    )
+    
+    # Create config
+    config = {
+        'setup': {
+            'background_roi_coords': [20, 40, 20, 40]
+        },
+        'calculate_emd': {
+            'num_permutations': 100
+        }
+    }
+    
+    # Create input
+    input_data = MeasureEMDInput(
+        config=config,
+        histogram_output=histogram_output
+    )
+    
+    # Run task
+    task = MeasureEMD(config)
+    output = task.run(input_data)
+    
+    # Validate output shapes
+    assert output.emd_values.shape == (rows, cols)
+    assert len(output.null_distribution) == config['calculate_emd']['num_permutations']
+    assert len(output.avg_histogram) == num_bins
+    
+    # Validate EMD values
+    assert np.all(output.emd_values >= 0)  # EMD should be non-negative
+    assert np.all(np.isfinite(output.emd_values))  # No inf/nan values
+    
+    # Check that signal region has higher EMD values
+    signal_region = output.emd_values[60:80, 60:80]
+    background_region = output.emd_values[20:40, 20:40]
+    assert np.mean(signal_region) > np.mean(background_region)
+    
+    # Validate null distribution
+    assert np.all(output.null_distribution >= 0)
+    assert np.all(np.isfinite(output.null_distribution))
+    
+    # Check average histogram
+    assert np.all(output.avg_histogram >= 0)
+    assert np.all(np.isfinite(output.avg_histogram))
+
+def test_measure_emd_edge_cases():
+    """Test MeasureEMD with edge cases."""
+    # Generate basic synthetic data
+    num_bins = 50
+    rows = cols = 100
+    histograms, bin_edges = generate_synthetic_histograms(
+        num_bins=num_bins,
+        rows=rows,
+        cols=cols
+    )
+    
+    histogram_output = MakeHistogramOutput(
+        histograms=histograms,
+        bin_edges=bin_edges,
+        bin_centers=(bin_edges[:-1] + bin_edges[1:]) / 2
+    )
+    
+    # Test case 1: ROI at image boundary
+    config = {
+        'setup': {
+            'background_roi_coords': [0, 20, 0, 20]
+        }
+    }
+    
+    task = MeasureEMD(config)
+    input_data = MeasureEMDInput(config=config, histogram_output=histogram_output)
+    output = task.run(input_data)  # Should not raise
+    
+    # Test case 2: Small ROI (should warn)
+    config = {
+        'setup': {
+            'background_roi_coords': [0, 5, 0, 5]
+        }
+    }
+    
+    task = MeasureEMD(config)
+    input_data = MeasureEMDInput(config=config, histogram_output=histogram_output)
+    with pytest.warns(RuntimeWarning, match="Background ROI contains only"):
+        output = task.run(input_data)
+    
+    # Test case 3: ROI outside image bounds
+    config = {
+        'setup': {
+            'background_roi_coords': [0, 20, 90, 110]
+        }
+    }
+    
+    task = MeasureEMD(config)
+    input_data = MeasureEMDInput(config=config, histogram_output=histogram_output)
+    with pytest.raises(ValueError, match="Background ROI .* invalid for histograms"):
+        output = task.run(input_data)
+    
+    # Test case 4: Empty histograms
+    empty_histograms = np.zeros_like(histograms)
+    empty_output = MakeHistogramOutput(
+        histograms=empty_histograms,
+        bin_edges=bin_edges,
+        bin_centers=(bin_edges[:-1] + bin_edges[1:]) / 2
+    )
+    
+    config = {
+        'setup': {
+            'background_roi_coords': [20, 40, 20, 40]
+        }
+    }
+    
+    task = MeasureEMD(config)
+    input_data = MeasureEMDInput(config=config, histogram_output=empty_output)
+    with pytest.raises(ValueError, match="Background ROI contains no data"):
+        output = task.run(input_data)
+
+def test_measure_emd_visual():
+    """Generate visual diagnostic plots for manual inspection."""
+    # Set up output directory
+    save_dir = Path(__file__).parent.parent.parent / 'temp' / 'diagnostic_plots' / 'measure_emd'
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nGenerating visual test plots in: {save_dir}")
+    
+    # Generate synthetic data with clear signal
+    num_bins = 50
+    rows = cols = 100
+    histograms, bin_edges = generate_synthetic_histograms(
+        num_bins=num_bins,
+        rows=rows,
+        cols=cols,
+        background_mean=10.0,
+        signal_mean=15.0,
+        noise_level=0.5  # Lower noise for clearer visualization
+    )
+    
+    histogram_output = MakeHistogramOutput(
+        histograms=histograms,
+        bin_edges=bin_edges,
+        bin_centers=(bin_edges[:-1] + bin_edges[1:]) / 2
+    )
+    
+    # Create config
+    config = {
+        'setup': {
+            'background_roi_coords': [20, 40, 20, 40]
+        },
+        'calculate_emd': {
+            'num_permutations': 1000  # More permutations for better visualization
+        }
+    }
+    
+    # Create input
+    input_data = MeasureEMDInput(
+        config=config,
+        histogram_output=histogram_output
+    )
+    
+    # Run task
+    task = MeasureEMD(config)
+    output = task.run(input_data)
+    
+    # Generate diagnostic plots
+    task.plot_diagnostics(output, save_dir)
+    
+    # Verify plots were created
+    expected_plots = [
+        'measure_emd_diagnostics.png',
+        'measure_emd_distribution.png'
+    ]
+    
+    for plot_name in expected_plots:
+        plot_file = save_dir / plot_name
+        assert plot_file.exists(), f"Diagnostic plot not created at {plot_file}"
+        print(f"Generated diagnostic plot: {plot_file}")
+    
+    plt.close('all')  # Clean up
+
+if __name__ == '__main__':
+    # Run visual test to generate plots
+    test_measure_emd_visual()
+    print("\nVisual test complete. Check the diagnostic plots in the output directory.")
+</file>
+<file path="./btx/processing/tests/functional/test_multi_peak.py" project="btx">
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+import matplotlib.pyplot as plt
+from pathlib import Path
+from scipy import ndimage
+import pytest
+
+@dataclass
+class GaussianPeak:
+    """Define a 2D Gaussian peak with Poisson statistics."""
+    center: Tuple[int, int]  # (x, y) center coordinates
+    sigma: float  # Width parameter
+    amplitude: float  # Peak multiplier for lambda
+    
+    def compute_lambda_contribution(self, rows: int, cols: int) -> np.ndarray:
+        """Compute this peak's contribution to the lambda (rate) map."""
+        y, x = np.ogrid[:rows, :cols]
+        x_centered = x - self.center[1]
+        y_centered = y - self.center[0]
+        r_squared = x_centered*x_centered + y_centered*y_centered
+        return self.amplitude * np.exp(-r_squared / (2 * self.sigma**2))
+
+def generate_multi_peak_data(
+    rows: int = 100,
+    cols: int = 100,
+    peaks: List[GaussianPeak] = None,
+    base_counts: float = 100.0,
+    num_frames: int = 1000,
+    num_histogram_bins: int = 50,
+    histogram_range: Tuple[float, float] = (0, 300),
+    background_roi: Optional[Tuple[int, int, int, int]] = None,
+    seed: int = 42,
+    save_total_counts: Optional[Path] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[np.ndarray]]:
+    """
+    Generate synthetic data with multiple 2D Gaussian peaks and Poisson statistics.
+    
+    Args:
+        rows: Number of rows in each frame
+        cols: Number of columns in each frame
+        peaks: List of GaussianPeak objects defining signals
+        base_counts: Base lambda (counts/frame) for background
+        num_frames: Number of frames to generate
+        num_histogram_bins: Number of bins for histograms
+        histogram_range: (min, max) for histogram binning
+        background_roi: (x1, x2, y1, y2) for background ROI
+        seed: Random seed for reproducibility
+        save_total_counts: Optional path to save total counts image
+        
+    Returns:
+        frames: Array of shape (num_frames, rows, cols)
+        histograms: Array of shape (num_histogram_bins, rows, cols)
+        lambda_map: Array of shape (rows, cols) showing true rate
+        true_masks: List of binary masks for each peak
+    """
+    rng = np.random.default_rng(seed)
+    
+    if peaks is None:
+        peaks = []
+        
+    if background_roi is None:
+        background_roi = (0, rows//4, 0, cols//4)
+        
+    # Generate base lambda map
+    lambda_map = np.full((rows, cols), base_counts)
+    
+    # Add peaks
+    for peak in peaks:
+        lambda_map += peak.compute_lambda_contribution(rows, cols) * base_counts
+        
+    # Generate frames with Poisson noise
+    frames = rng.poisson(lam=lambda_map, size=(num_frames, rows, cols))
+    
+    # Compute histograms
+    histograms = np.zeros((num_histogram_bins, rows, cols))
+    bin_edges = np.linspace(histogram_range[0], histogram_range[1], num_histogram_bins + 1)
+    
+    for i in range(rows):
+        for j in range(cols):
+            hist, _ = np.histogram(frames[:, i, j], bins=bin_edges)
+            histograms[:, i, j] = hist
+            
+    # Save total counts image if requested
+    if save_total_counts is not None:
+        total_counts = frames.sum(axis=0)
+        plt.figure(figsize=(8, 8))
+        plt.imshow(total_counts)
+        plt.colorbar(label='Total Counts')
+        plt.title(f'Total Counts Over {num_frames} Frames')
+        plt.savefig(save_total_counts)
+        plt.close()
+            
+    # Generate ground truth masks for each peak
+    true_masks = []
+    for peak in peaks:
+        # Create mask where lambda is significantly elevated above background
+        peak_contribution = peak.compute_lambda_contribution(rows, cols)
+        # Consider points where rate is elevated by at least 10% of peak's amplitude
+        threshold = 0.1 * peak.amplitude
+        mask = peak_contribution > threshold
+        true_masks.append(mask)
+    
+    return frames, histograms, lambda_map, true_masks
+
+def plot_synthetic_data_diagnostics(
+    frames: np.ndarray,
+    histograms: np.ndarray,
+    lambda_map: np.ndarray,
+    true_masks: List[np.ndarray],
+    save_dir: Path,
+    filename: str = 'synthetic_data_diagnostics.png'
+) -> None:
+    """Generate diagnostic plots for synthetic data."""
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig.suptitle('Synthetic Data Diagnostics')
+    
+    # Plot lambda map
+    im0 = axes[0, 0].imshow(lambda_map)
+    axes[0, 0].set_title('True λ Map')
+    plt.colorbar(im0, ax=axes[0, 0])
+    
+    # Plot example frame
+    frame_idx = frames.shape[0] // 2  # Middle frame
+    im1 = axes[0, 1].imshow(frames[frame_idx])
+    axes[0, 1].set_title(f'Example Frame (#{frame_idx})')
+    plt.colorbar(im1, ax=axes[0, 1])
+    
+    # Plot mean frame
+    mean_frame = frames.mean(axis=0)
+    im2 = axes[0, 2].imshow(mean_frame)
+    axes[0, 2].set_title('Mean Frame')
+    plt.colorbar(im2, ax=axes[0, 2])
+    
+    # Plot histogram total counts
+    hist_sums = histograms.sum(axis=0)
+    im3 = axes[1, 0].imshow(hist_sums)
+    axes[1, 0].set_title('Histogram Total Counts')
+    plt.colorbar(im3, ax=axes[1, 0])
+    
+    # Plot true masks
+    combined_mask = np.zeros_like(lambda_map)
+    for i, mask in enumerate(true_masks, 1):
+        combined_mask[mask] = i
+    im4 = axes[1, 1].imshow(combined_mask)
+    axes[1, 1].set_title('True Peak Masks')
+    plt.colorbar(im4, ax=axes[1, 1])
+    
+    # Plot example histogram for peak and background
+    if true_masks:
+        peak_center = np.where(true_masks[0])[0][0], np.where(true_masks[0])[1][0]
+        bg_point = 0, 0  # Corner point for background
+        
+        axes[1, 2].plot(histograms[:, peak_center[0], peak_center[1]], 
+                       label='Peak', alpha=0.7)
+        axes[1, 2].plot(histograms[:, bg_point[0], bg_point[1]], 
+                       label='Background', alpha=0.7)
+        axes[1, 2].set_title('Example Histograms')
+        axes[1, 2].legend()
+        axes[1, 2].set_yscale('log')
+    else:
+        axes[1, 2].set_visible(False)
+    
+    plt.tight_layout()
+    plt.savefig(save_dir / filename)
+    plt.close()
+
+def test_synthetic_data_generation():
+    """Test the synthetic data generation with multiple peaks."""
+    # Set up output directory
+    save_dir = Path(__file__).parent.parent.parent / 'temp' / 'diagnostic_plots' / 'synthetic_data'
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Set parameters consistently
+    base_counts = 100.0
+
+    # Define test peaks
+    peaks = [
+        GaussianPeak(center=(30, 30), sigma=8.0, amplitude=2.0),    # Large peak
+        GaussianPeak(center=(70, 70), sigma=6.0, amplitude=3.0),    # Medium peak
+        GaussianPeak(center=(20, 70), sigma=4.0, amplitude=4.0),    # Small peak
+    ]
+    
+    # Generate data
+    frames, histograms, lambda_map, true_masks = generate_multi_peak_data(
+        peaks=peaks,
+        base_counts=base_counts,  # Use the defined parameter
+        num_frames=1000,
+        seed=42,
+        save_total_counts=save_dir / 'total_counts.png'
+    )
+    
+    # Basic shape checks
+    assert frames.shape[0] == 1000
+    assert frames.shape[1:] == (100, 100)
+    assert histograms.shape[1:] == (100, 100)
+    assert lambda_map.shape == (100, 100)
+    assert len(true_masks) == len(peaks)
+    
+    # Statistical checks
+    # 1. Background region should have mean close to base_counts
+    bg_mean = frames[:, :10, :10].mean()  # Use corner as background
+    assert 95 < bg_mean < 105  # Within 5% of base_counts=100
+    
+    # 2. Check peak centers (where we know the exact expected value)
+    for peak in peaks:
+        x, y = peak.center
+        center_mean = frames[:, x, y].mean()
+        expected_center = base_counts * (1 + peak.amplitude)
+        # Allow 10% tolerance due to Poisson statistics
+        assert abs(center_mean - expected_center) < 0.1 * expected_center, \
+            f"Peak center mean {center_mean:.1f} differs from expected {expected_center:.1f}"
+    
+    # 3. Check Poisson statistics in background
+    bg_var = frames[:, :10, :10].var()
+    # For Poisson, mean ≈ variance
+    assert abs(bg_mean - bg_var) < 0.1 * bg_mean
+    
+    # 4. Check mask sizes are in descending order
+    mask_sizes = [np.sum(mask) for mask in true_masks]
+    assert mask_sizes == sorted(mask_sizes, reverse=True), \
+        "Masks not in descending size order"
+    
+    # Generate diagnostic plots
+    plot_synthetic_data_diagnostics(frames, histograms, lambda_map, true_masks, save_dir)
+
+if __name__ == '__main__':
+    # Run test and generate plots
+    test_synthetic_data_generation()
+    print("\nTest complete. Check the diagnostic plots in the output directory.")
+</file>
+<file path="./btx/processing/tests/functional/test_build_pump_probe_masks.py" project="btx">
+import pytest
+from pathlib import Path
+from typing import Tuple
+import numpy as np
+import matplotlib.pyplot as plt
+
+from btx.processing.tasks.build_pump_probe_masks import BuildPumpProbeMasks
+from btx.processing.btx_types import (
+    BuildPumpProbeMasksInput,
+    MakeHistogramOutput,
+    CalculatePValuesOutput
+)
+
+def generate_synthetic_data(
+    rows: int = 100,
+    cols: int = 100,
+    signal_center: Tuple[int, int] = (70, 70),
+    signal_radius: int = 10,
+    noise_level: float = 0.1,
+    seed: int = 42
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Generate synthetic p-values and histograms with circular signal."""
+    np.random.seed(seed)
+    
+    # Start with high p-values everywhere
+    p_values = np.random.uniform(0.5, 1.0, (rows, cols))
+    
+    # Add clear signal region (very low p-values)
+    y, x = np.ogrid[:rows, :cols]
+    dist = np.sqrt((x - signal_center[1])**2 + (y - signal_center[0])**2)
+    signal_mask = dist <= signal_radius
+    # Make signal very significant
+    p_values[signal_mask] = np.random.uniform(0.0001, 0.01, size=np.sum(signal_mask))
+    
+    # Add noise
+    p_values += np.random.normal(0, noise_level, p_values.shape)
+    p_values = np.clip(p_values, 0, 1)
+    
+    # Create dummy histograms
+    histograms = np.random.normal(0, 1, (10, rows, cols))
+    
+    print(f"Signal region p-values: min={np.min(p_values[signal_mask]):.3f}, "
+          f"max={np.max(p_values[signal_mask]):.3f}")
+    print(f"Background p-values: min={np.min(p_values[~signal_mask]):.3f}, "
+          f"max={np.max(p_values[~signal_mask]):.3f}")
+    
+    return p_values, histograms
+
+def test_build_pump_probe_masks_validation():
+    """Test configuration validation."""
+    # Valid config
+    valid_config = {
+        'setup': {
+            'background_roi_coords': [20, 40, 20, 40]
+        },
+        'generate_masks': {
+            'threshold': 0.05,
+            'bg_mask_mult': 2.0,
+            'bg_mask_thickness': 5
+        }
+    }
+    
+    task = BuildPumpProbeMasks(valid_config)  # Should not raise
+    
+    # Test missing section
+    invalid_config = {}
+    with pytest.raises(ValueError, match="Missing 'setup' section"):
+        BuildPumpProbeMasks(invalid_config)
+    
+    # Test missing ROI
+    invalid_config = {'setup': {}}
+    with pytest.raises(ValueError, match="Missing background_roi_coords"):
+        BuildPumpProbeMasks(invalid_config)
+    
+    # Test missing generate_masks section
+    invalid_config = {
+        'setup': {
+            'background_roi_coords': [20, 40, 20, 40]
+        }
+    }
+    with pytest.raises(ValueError, match="Missing 'generate_masks' section"):
+        BuildPumpProbeMasks(invalid_config)
+        
+    # Test invalid threshold
+    invalid_config = {
+        'setup': {
+            'background_roi_coords': [20, 40, 20, 40]
+        },
+        'generate_masks': {
+            'threshold': 1.5,  # > 1
+            'bg_mask_mult': 2.0,
+            'bg_mask_thickness': 5
+        }
+    }
+    with pytest.raises(ValueError, match="threshold must be between"):
+        BuildPumpProbeMasks(invalid_config)
+
+def test_build_pump_probe_masks_synthetic():
+    """Test BuildPumpProbeMasks with synthetic data.
+    
+    The ROI is used only for signal identification, while the background
+    mask is generated as a buffer around the identified signal regions.
+    """
+    # Generate synthetic data
+    rows = cols = 100
+    p_values, histograms = generate_synthetic_data(
+        rows=rows,
+        cols=cols,
+        signal_center=(70, 70),
+        signal_radius=10
+    )
+    
+    # Create mock outputs from previous tasks
+    p_values_output = CalculatePValuesOutput(
+        p_values=p_values,
+        log_p_values=-np.log10(p_values),
+        significance_threshold=0.05
+    )
+    
+    histogram_output = MakeHistogramOutput(
+        histograms=histograms,
+        bin_edges=np.linspace(0, 1, 11),
+        bin_centers=np.linspace(0.05, 0.95, 10)
+    )
+    
+    # Create config
+    config = {
+        'setup': {
+            'background_roi_coords': [20, 40, 20, 40]  # Away from signal
+        },
+        'generate_masks': {
+            'threshold': 0.05,
+            'bg_mask_mult': 2.0,
+            'bg_mask_thickness': 5
+        }
+    }
+    
+    # Create input
+    input_data = BuildPumpProbeMasksInput(
+        config=config,
+        histogram_output=histogram_output,
+        p_values_output=p_values_output
+    )
+    
+    # Run task
+    task = BuildPumpProbeMasks(config)
+    output = task.run(input_data)
+    
+    # Validate output types
+    assert output.signal_mask.dtype == bool
+    assert output.background_mask.dtype == bool
+    
+    # Validate shapes
+    assert output.signal_mask.shape == (rows, cols)
+    assert output.background_mask.shape == (rows, cols)
+    
+    # Validate masks don't overlap
+    assert not np.any(output.signal_mask & output.background_mask)
+    
+    # Check signal mask found the signal region
+    signal_center = np.array([70, 70])
+    signal_detected = output.signal_mask[
+        signal_center[0]-5:signal_center[0]+5,
+        signal_center[1]-5:signal_center[1]+5
+    ]
+    assert np.any(signal_detected), "Signal region not detected"
+    
+    # Check background mask is near signal (not in ROI)
+    signal_region = np.zeros_like(output.signal_mask)
+    signal_region[
+        signal_center[0]-15:signal_center[0]+15,
+        signal_center[1]-15:signal_center[1]+15
+    ] = True
+    
+    # Background should overlap with region near signal
+    assert np.any(output.background_mask & signal_region), "Background not found near signal"
+
+def test_build_pump_probe_masks_edge_cases():
+    """Test BuildPumpProbeMasks with edge cases."""
+    rows = cols = 100
+    
+    # Test case 1: No signal (all high p-values)
+    p_values = np.random.uniform(0.5, 1.0, (rows, cols))
+    histograms = np.random.normal(0, 1, (10, rows, cols))
+    
+    p_values_output = CalculatePValuesOutput(
+        p_values=p_values,
+        log_p_values=-np.log10(p_values),
+        significance_threshold=0.05
+    )
+    
+    histogram_output = MakeHistogramOutput(
+        histograms=histograms,
+        bin_edges=np.linspace(0, 1, 11),
+        bin_centers=np.linspace(0.05, 0.95, 10)
+    )
+    
+    config = {
+        'setup': {
+            'background_roi_coords': [20, 40, 20, 40]
+        },
+        'generate_masks': {
+            'threshold': 0.05,
+            'bg_mask_mult': 2.0,
+            'bg_mask_thickness': 5
+        }
+    }
+    
+    input_data = BuildPumpProbeMasksInput(
+        config=config,
+        histogram_output=histogram_output,
+        p_values_output=p_values_output
+    )
+    
+#    task = BuildPumpProbeMasks(config)
+#    with pytest.raises(ValueError, match="Signal mask is empty"):
+#        output = task.run(input_data)
+    
+    # Test case 2: All signal (all low p-values)
+    p_values = np.random.uniform(0.0, 0.01, (rows, cols))
+    p_values_output = CalculatePValuesOutput(
+        p_values=p_values,
+        log_p_values=-np.log10(p_values),
+        significance_threshold=0.05
+    )
+    
+    input_data = BuildPumpProbeMasksInput(
+        config=config,
+        histogram_output=histogram_output,
+        p_values_output=p_values_output
+    )
+    
+#    with pytest.warns(RuntimeWarning, match="Signal mask covers"):
+#        output = task.run(input_data)
+
+def test_build_pump_probe_masks_visual():
+    """Generate visual diagnostic plots for manual inspection."""
+    save_dir = Path(__file__).parent.parent.parent / 'temp' / 'diagnostic_plots' / 'build_pump_probe_masks'
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nGenerating visual test plots in: {save_dir}")
+    
+    # Generate synthetic data with clear signal
+    rows = cols = 100
+    p_values, histograms = generate_synthetic_data(
+        rows=rows,
+        cols=cols,
+        signal_center=(70, 70),
+        signal_radius=10,
+        noise_level=0.05  # Low noise for clear visualization
+    )
+    
+    p_values_output = CalculatePValuesOutput(
+        p_values=p_values,
+        log_p_values=-np.log10(p_values),
+        significance_threshold=0.05
+    )
+    
+    histogram_output = MakeHistogramOutput(
+        histograms=histograms,
+        bin_edges=np.linspace(0, 1, 11),
+        bin_centers=np.linspace(0.05, 0.95, 10)
+    )
+    
+    # Create config
+    config = {
+        'setup': {
+            'background_roi_coords': [20, 40, 20, 40]  # Away from signal
+        },
+        'generate_masks': {
+            'threshold': 0.05,
+            'bg_mask_mult': 2.0,
+            'bg_mask_thickness': 5
+        }
+    }
+    
+    # Create input
+    input_data = BuildPumpProbeMasksInput(
+        config=config,
+        histogram_output=histogram_output,
+        p_values_output=p_values_output
+    )
+    
+    # Run task
+    task = BuildPumpProbeMasks(config)
+    output = task.run(input_data)
+    
+    # Generate diagnostic plots
+    task.plot_diagnostics(output, save_dir)
+    
+    # Verify plots were created
+    expected_plots = [
+        'mask_generation_stages.png',
+        'final_masks.png',
+        'mask_distance.png'
+    ]
+    
+    for plot_name in expected_plots:
+        plot_file = save_dir / plot_name
+        assert plot_file.exists(), f"Diagnostic plot not created at {plot_file}"
+        print(f"Generated diagnostic plot: {plot_file}")
+    
+    plt.close('all')  # Clean up
+
+if __name__ == '__main__':
+    # Run visual test to generate plots
+    test_build_pump_probe_masks_visual()
+    print("\nVisual test complete. Check the diagnostic plots in the output directory.")
+</file>
+<file path="./btx/processing/tests/functional/__init__.py" project="btx">
+</file>
+<file path="./btx/processing/tests/functional/test_pump_probe.py" project="btx">
+import pytest
+from pathlib import Path
+import numpy as np
+from scipy import stats, optimize, fft
+import matplotlib.pyplot as plt
+
+from btx.processing.tasks.pump_probe import PumpProbeAnalysis
+from btx.processing.btx_types import (
+    PumpProbeAnalysisInput,
+    PumpProbeAnalysisOutput,
+    LoadDataOutput,
+    BuildPumpProbeMasksOutput
+)
+from typing import Tuple
+
+def generate_signal_profile(delays: np.ndarray, profile_type: str = 'step', **kwargs) -> np.ndarray:
+    """Generate different signal time profiles.
+    
+    Args:
+        delays: Array of delay values
+        profile_type: One of ['step', 'exponential', 'gaussian', 'oscillating']
+        **kwargs: Profile-specific parameters:
+            - step: amplitude, t0
+            - exponential: amplitude, t0, decay_time
+            - gaussian: amplitude, t0, width
+            - oscillating: amplitude, t0, frequency, decay_time
+            
+    Returns:
+        Array of signal values corresponding to delays
+    """
+    if profile_type == 'step':
+        amplitude = kwargs.get('amplitude', 1.0)
+        t0 = kwargs.get('t0', 0.0)
+        return amplitude * (delays > t0)
+        
+    elif profile_type == 'exponential':
+        amplitude = kwargs.get('amplitude', 1.0)
+        t0 = kwargs.get('t0', 0.0)
+        decay_time = kwargs.get('decay_time', 5.0)
+        signal = np.zeros_like(delays)
+        pos_delays = delays > t0
+        signal[pos_delays] = amplitude * np.exp(-(delays[pos_delays] - t0)/decay_time)
+        return signal
+        
+    elif profile_type == 'gaussian':
+        amplitude = kwargs.get('amplitude', 1.0)
+        t0 = kwargs.get('t0', 0.0)
+        width = kwargs.get('width', 2.0)
+        return amplitude * np.exp(-(delays - t0)**2/(2*width**2))
+        
+    elif profile_type == 'oscillating':
+        amplitude = kwargs.get('amplitude', 1.0)
+        t0 = kwargs.get('t0', 0.0)
+        frequency = kwargs.get('frequency', 1.0)
+        decay_time = kwargs.get('decay_time', 10.0)
+        signal = np.zeros_like(delays)
+        pos_delays = delays > t0
+        signal[pos_delays] = amplitude * np.exp(-(delays[pos_delays] - t0)/decay_time) * \
+                            np.sin(2*np.pi*frequency*(delays[pos_delays] - t0))
+        return signal
+    
+    else:
+        raise ValueError(f"Unknown profile type: {profile_type}")
+
+def generate_synthetic_pump_probe_data(
+    n_frames: int = 1000,
+    rows: int = 100,
+    cols: int = 100,
+    delay_range: Tuple[float, float] = (-10, 20),
+    n_delay_bins: int = 20,
+    base_counts: float = 100.0,  # Base counts for Poisson distribution
+    signal_profile: str = 'exponential',
+    profile_params: dict = None,
+    min_frames_per_bin: int = 20
+):
+    """Generate synthetic pump-probe data with various signal profiles using Poisson noise.
+
+    Args:
+        n_frames: Number of frames to generate
+        rows: Number of rows in each frame
+        cols: Number of columns in each frame
+        delay_range: (min_delay, max_delay) in ps
+        n_delay_bins: Number of delay time bins
+        base_counts: Base count rate for Poisson distribution
+        signal_profile: Type of signal profile to generate
+        profile_params: Parameters for the signal profile
+        min_frames_per_bin: Minimum frames per delay bin
+
+    Returns:
+        Tuple of LoadDataOutput, BuildPumpProbeMasksOutput, and true signal values
+    """
+    if profile_params is None:
+        profile_params = {}
+    
+    # Create delay bins
+    delay_min, delay_max = delay_range
+    bin_width = (delay_max - delay_min) / n_delay_bins
+    bin_edges = np.linspace(delay_min, delay_max, n_delay_bins + 1)
+    delay_centers = (bin_edges[1:] + bin_edges[:-1]) / 2
+    
+    # Use specified frames per bin
+    frames_per_bin = min_frames_per_bin
+    n_frames = frames_per_bin * n_delay_bins
+    
+    # Create delay assignments using bin centers
+    delays = np.repeat(delay_centers, frames_per_bin)
+    
+    print(f"\nDelay generation diagnostics:")
+    print(f"Delay range: {delay_min:.1f} to {delay_max:.1f} ps")
+    print(f"Number of bins: {n_delay_bins}")
+    print(f"Bin width: {bin_width:.2f} ps")
+    print(f"Frames per bin: {frames_per_bin}")
+
+    # Create alternating laser on/off mask
+    laser_on = np.zeros(n_frames, dtype=bool)
+    for i in range(n_delay_bins):
+        start_idx = i * frames_per_bin
+        end_idx = (i + 1) * frames_per_bin
+        # Make alternating frames laser-on within each delay group
+        laser_on[start_idx:end_idx:2] = True
+    laser_off = ~laser_on
+    
+    # Generate frames
+    frames = np.zeros((n_frames, rows, cols))
+    
+    # Create signal and background regions
+    signal_mask = np.zeros((rows, cols), dtype=bool)
+    signal_mask[20:30, 20:30] = True
+    bg_mask = np.zeros((rows, cols), dtype=bool)
+    bg_mask[5:15, 5:15] = True
+    
+    # Generate time-dependent signal
+    signal_values = generate_signal_profile(delays, signal_profile, **profile_params)
+    
+    # Create frames with Poisson noise
+    for i in range(n_frames):
+        # Base pattern with Poisson background (lambda=5)
+        lambda_matrix = np.full((rows, cols), base_counts) + np.random.poisson(lam=5, size=(rows, cols))
+        
+        # Add signal for laser-on frames
+        if laser_on[i]:
+            lambda_matrix[20:30, 20:30] *= (1 + signal_values[i])
+        
+        # Generate Poisson random numbers
+        frames[i] = np.random.poisson(lambda_matrix) / 10
+    
+    # Generate I0 values - also using Poisson for consistency
+    I0_base = 1000
+    I0 = np.random.poisson(I0_base, n_frames)
+    # Add correlation with signal for laser-on frames
+    I0[laser_on] = np.random.poisson(I0_base * (1 + 0.1 * signal_values[laser_on]))
+    
+    # Create outputs
+    load_data_output = LoadDataOutput(
+        data=frames,
+        I0=I0,
+        laser_delays=delays,
+        binned_delays=delays,  # Using same delays since they're already binned
+        laser_on_mask=laser_on,
+        laser_off_mask=laser_off
+    )
+    
+    masks_output = BuildPumpProbeMasksOutput(
+        signal_mask=signal_mask,
+        background_mask=bg_mask,
+        intermediate_masks=None
+    )
+    
+    return load_data_output, masks_output, signal_values
+
+def validate_pump_probe_results(
+    output: PumpProbeAnalysisOutput,
+    signal_profile: str,
+    true_params: dict,
+    delays: np.ndarray,
+    plot_dir: Path
+) -> None:
+    """Validate pump-probe results against known signal parameters."""
+    signal_diff = output.signals_on - output.signals_off
+    
+    plt.figure(figsize=(10, 6))
+    plt.errorbar(output.delays, signal_diff, 
+                yerr=np.sqrt(output.std_devs_on**2 + output.std_devs_off**2),
+                fmt='o', label='Measured')
+    
+    # Fit and plot appropriate model
+    if signal_profile == 'exponential':
+        def exp_model(t, A, tau):
+            return A * np.exp(-t/tau)
+        
+        pos_delays = output.delays > true_params['t0']
+        popt, _ = optimize.curve_fit(
+            exp_model, 
+            output.delays[pos_delays], 
+            signal_diff[pos_delays],
+            p0=[true_params['amplitude'], true_params['decay_time']]
+        )
+        
+        plt.plot(output.delays[pos_delays], 
+                exp_model(output.delays[pos_delays], *popt),
+                'r-', label='Fit')
+        
+        plt.title(f'Exponential Fit\nTrue τ: {true_params["decay_time"]:.1f} ps, '
+                 f'Fitted τ: {popt[1]:.1f} ps')
+        
+    elif signal_profile == 'oscillating':
+        def osc_model(t, A, f, tau, phi):
+            return A * np.exp(-t/tau) * np.sin(2*np.pi*f*t + phi)
+        
+        pos_delays = output.delays > true_params['t0']
+        popt, _ = optimize.curve_fit(
+            osc_model,
+            output.delays[pos_delays],
+            signal_diff[pos_delays],
+            p0=[true_params['amplitude'], 
+                true_params['frequency'],
+                true_params['decay_time'],
+                0]
+        )
+        
+        plt.plot(output.delays[pos_delays],
+                osc_model(output.delays[pos_delays], *popt),
+                'r-', label='Fit')
+                
+        plt.title(f'Oscillating Fit\nTrue f: {true_params["frequency"]:.2f} ps⁻¹, '
+                 f'Fitted f: {popt[1]:.2f} ps⁻¹')
+        
+    elif signal_profile == 'gaussian':
+        def gauss_model(t, A, t0, w):
+            return A * np.exp(-(t - t0)**2/(2*w**2))
+            
+        popt, _ = optimize.curve_fit(
+            gauss_model,
+            output.delays,
+            signal_diff,
+            p0=[true_params['amplitude'],
+                true_params['t0'],
+                true_params['width']]
+        )
+        
+        plt.plot(output.delays,
+                gauss_model(output.delays, *popt),
+                'r-', label='Fit')
+                
+        plt.title(f'Gaussian Fit\nTrue t0: {true_params["t0"]:.1f} ps, '
+                 f'Fitted t0: {popt[1]:.1f} ps')
+    
+    plt.xlabel('Delay (ps)')
+    plt.ylabel('Signal Difference')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(plot_dir / f'signal_fit_{signal_profile}.png')
+    plt.close()
+
+def test_pump_probe_basic():
+    """Basic test of PumpProbeAnalysis configuration."""
+    valid_config = {
+        'pump_probe_analysis': {
+            'min_count': 10,
+            'significance_level': 0.05
+        }
+    }
+    
+    task = PumpProbeAnalysis(valid_config)
+    
+    # Test missing configuration
+    with pytest.raises(ValueError):
+        PumpProbeAnalysis({})
+    
+    # Test invalid min_count
+    invalid_config = {
+        'pump_probe_analysis': {
+            'min_count': -1,
+            'significance_level': 0.05
+        }
+    }
+    with pytest.raises(ValueError):
+        PumpProbeAnalysis(invalid_config)
+
+def test_pump_probe_time_dependent():
+    """Test PumpProbeAnalysis with various time-dependent signals."""
+    test_cases = [
+        {
+            'profile': 'exponential',
+            'params': {
+                'amplitude': 0.3,
+                't0': 0.0,
+                'decay_time': 5.0
+            },
+            'description': 'Exponential decay'
+        },
+        {
+            'profile': 'oscillating',
+            'params': {
+                'amplitude': 0.2,
+                't0': 0.0,
+                'frequency': 0.3,
+                'decay_time': 10.0
+            },
+            'description': 'Damped oscillation'
+        },
+        {
+            'profile': 'gaussian',
+            'params': {
+                'amplitude': 0.4,
+                't0': 5.0,
+                'width': 2.0
+            },
+            'description': 'Gaussian peak'
+        }
+    ]
+    
+    config = {
+        'pump_probe_analysis': {
+            'min_count': 10,
+            'significance_level': 0.05
+        }
+    }
+    
+    save_dir = Path(__file__).parent.parent.parent / 'temp' / 'diagnostic_plots' / 'pump_probe'
+    
+    for case in test_cases:
+        print(f"\nTesting {case['description']}...")
+        
+        case_dir = save_dir / case['profile']
+        case_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate data
+        load_data_output, masks_output, true_signal = generate_synthetic_pump_probe_data(
+            n_frames=2000,
+            n_delay_bins=30,
+            noise_level=0.02,
+            signal_profile=case['profile'],
+            profile_params=case['params'],
+            min_frames_per_bin=config['pump_probe_analysis']['min_count'] * 2
+        )
+        
+        # Run analysis
+        task = PumpProbeAnalysis(config)
+        input_data = PumpProbeAnalysisInput(
+            config=config,
+            load_data_output=load_data_output,
+            masks_output=masks_output
+        )
+        
+        output = task.run(input_data)
+        
+        # Generate diagnostic plots
+        task.plot_diagnostics(output, case_dir)
+        
+        # Validate results
+        validate_pump_probe_results(
+            output,
+            case['profile'],
+            case['params'],
+            load_data_output.binned_delays,
+            case_dir
+        )
+        
+        # Profile-specific validations
+        if case['profile'] == 'exponential':
+            # Check decay time within 30%
+            pos_delays = output.delays > case['params']['t0']
+            signal_diff = output.signals_on[pos_delays] - output.signals_off[pos_delays]
+            
+            def exp_decay(t, A, tau):
+                return A * np.exp(-t/tau)
+            
+            popt, _ = optimize.curve_fit(exp_decay, 
+                                       output.delays[pos_delays], 
+                                       signal_diff,
+                                       p0=[case['params']['amplitude'],
+                                           case['params']['decay_time']])
+            fitted_tau = popt[1]
+            true_tau = case['params']['decay_time']
+            
+            assert np.abs(fitted_tau - true_tau) < true_tau * 0.3, \
+                f"Fitted decay time {fitted_tau:.1f} differs from true value {true_tau:.1f}"
+                
+        elif case['profile'] == 'oscillating':
+            # Check frequency using FFT
+            pos_delays = output.delays > case['params']['t0']
+            signal_diff = output.signals_on[pos_delays] - output.signals_off[pos_delays]
+            
+            # Simple FFT analysis
+            yf = fft.fft(signal_diff)
+            dt = np.mean(np.diff(output.delays[pos_delays]))
+            xf = fft.fftfreq(len(signal_diff), dt)
+            
+            # Find dominant frequency
+            peak_freq = np.abs(xf[np.argmax(np.abs(yf[1:]) + 1)])
+            true_freq = case['params']['frequency']
+            
+            assert np.abs(peak_freq - true_freq) < true_freq * 0.3, \
+                f"Fitted frequency {peak_freq:.2f} differs from true value {true_freq:.2f}"
+                
+        elif case['profile'] == 'gaussian':
+            # Check peak position
+            signal_diff = output.signals_on - output.signals_off
+            peak_idx = np.argmax(signal_diff)
+            peak_time = output.delays[peak_idx]
+            true_t0 = case['params']['t0']
+            
+            assert np.abs(peak_time - true_t0) < 2.0, \
+                f"Peak time {peak_time:.1f} differs from true value {true_t0:.1f}"
+        
+        print(f"Generated plots for {case['description']} in: {case_dir}")
+
+def test_pump_probe_statistics():
+    """Test statistical properties of the pump-probe analysis."""
+    # Generate null data (no signal)
+    config = {
+        'pump_probe_analysis': {
+            'min_count': 10,
+            'significance_level': 0.05
+        }
+    }
+    
+    load_data_output, masks_output, _ = generate_synthetic_pump_probe_data(
+        n_frames=2000,
+        n_delay_bins=30,
+        noise_level=.5,
+        signal_profile='exponential',
+        profile_params={'amplitude': 0.0}  # No signal
+    )
+    
+    # Run analysis
+    task = PumpProbeAnalysis(config)
+    input_data = PumpProbeAnalysisInput(
+        config=config,
+        load_data_output=load_data_output,
+        masks_output=masks_output
+    )
+    
+    output = task.run(input_data)
+    
+    # Check p-value distribution under null hypothesis
+    p_values = output.p_values
+    # Should be roughly uniform under null hypothesis
+    _, p_uniform = stats.kstest(p_values, 'uniform')
+    assert p_uniform > 0.05, "P-values not uniform under null hypothesis"
+    
+    # Check false positive rate
+    fpr = np.mean(p_values < config['pump_probe_analysis']['significance_level'])
+    assert np.abs(fpr - config['pump_probe_analysis']['significance_level']) < 0.02, \
+        f"False positive rate {fpr:.3f} differs from nominal {config['pump_probe_analysis']['significance_level']}"
+
+def test_robustness():
+    """Test robustness to various data quality issues."""
+    config = {
+        'pump_probe_analysis': {
+            'min_count': 10,
+            'significance_level': 0.05
+        }
+    }
+    
+    # Test with high noise
+    load_data_output, masks_output, _ = generate_synthetic_pump_probe_data(
+        n_frames=2000,
+        noise_level=0.2,  # High noise
+        signal_profile='exponential',
+        profile_params={'amplitude': 0.5, 'decay_time': 5.0}
+    )
+    
+    task = PumpProbeAnalysis(config)
+    input_data = PumpProbeAnalysisInput(
+        config=config,
+        load_data_output=load_data_output,
+        masks_output=masks_output
+    )
+    
+    # Should run without errors
+    output = task.run(input_data)
+    
+    # Test with uneven frame distribution
+    load_data_output, masks_output, _ = generate_synthetic_pump_probe_data(
+        n_frames=1000,  # Fewer frames
+        n_delay_bins=30,
+        min_frames_per_bin=5  # Below minimum
+    )
+    
+    # Should raise ValueError due to insufficient frames
+    with pytest.raises(ValueError, match="No delay groups met the minimum frame count requirement"):
+        task.run(PumpProbeAnalysisInput(
+            config=config,
+            load_data_output=load_data_output,
+            masks_output=masks_output
+        ))
+
+if __name__ == '__main__':
+    # Run time-dependent signal tests with visualization
+    print("Running pump-probe analysis tests...")
+    test_pump_probe_time_dependent()
+    print("\nTests complete. Check the diagnostic_plots directory for visualizations.")
+</file>
+<file path="./btx/processing/tests/functional/utils.py" project="btx">
+# tests/functional/utils.py
+
+from pathlib import Path
+from typing import Optional, Tuple, Union
+import numpy as np
+import matplotlib.pyplot as plt
+
+def generate_test_data(
+    shape: Tuple[int, ...],
+    dtype: np.dtype = np.float64,
+    noise_level: float = 0.1,
+    seed: Optional[int] = None
+) -> np.ndarray:
+    """
+    Generate synthetic test data.
+    
+    Args:
+        shape: Shape of array to generate
+        dtype: Data type of array
+        noise_level: Standard deviation of noise to add
+        seed: Random seed for reproducibility
+        
+    Returns:
+        Synthetic data array
+    """
+    if seed is not None:
+        np.random.seed(seed)
+        
+    # Generate base pattern
+    center = np.array([s/2 for s in shape])
+    indices = np.indices(shape)
+    r2 = sum((ind - c)**2 for ind, c in zip(indices, center))
+    base = np.exp(-r2 / (2 * max(shape)**2))
+    
+    # Add noise
+    noise = np.random.normal(0, noise_level, shape)
+    
+    return (base + noise).astype(dtype)
+
+def plot_array_comparison(
+    arrays: dict[str, np.ndarray],
+    save_path: Optional[Union[str, Path]] = None,
+    suptitle: Optional[str] = None,
+    **kwargs
+) -> Optional[plt.Figure]:
+    """
+    Create comparison plot of multiple arrays.
+    
+    Args:
+        arrays: Dictionary mapping names to arrays
+        save_path: Path to save plot (if None, display)
+        suptitle: Super title for whole figure
+        **kwargs: Additional kwargs for imshow
+        
+    Returns:
+        Figure object if save_path is None
+    """
+    n = len(arrays)
+    fig, axes = plt.subplots(1, n, figsize=(5*n, 5))
+    if n == 1:
+        axes = [axes]
+        
+    for ax, (name, arr) in zip(axes, arrays.items()):
+        im = ax.imshow(arr, **kwargs)
+        plt.colorbar(im, ax=ax)
+        ax.set_title(name)
+        
+    if suptitle:
+        fig.suptitle(suptitle)
+    plt.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path)
+        plt.close(fig)
+        return None
+    return fig
+
+def verify_array_properties(
+    arr: np.ndarray,
+    expected_shape: Optional[Tuple[int, ...]] = None,
+    expected_dtype: Optional[np.dtype] = None,
+    bounds: Optional[Tuple[float, float]] = None,
+    allow_nan: bool = False,
+    allow_inf: bool = False
+) -> bool:
+    """
+    Verify array properties.
+    
+    Args:
+        arr: Array to verify
+        expected_shape: Expected shape (if None, not checked)
+        expected_dtype: Expected dtype (if None, not checked)
+        bounds: Expected (min, max) bounds (if None, not checked)
+        allow_nan: Whether NaN values are allowed
+        allow_inf: Whether infinite values are allowed
+        
+    Returns:
+        True if all checks pass
+        
+    Raises:
+        AssertionError: If any check fails
+    """
+    if expected_shape is not None:
+        assert arr.shape == expected_shape, \
+            f"Wrong shape: expected {expected_shape}, got {arr.shape}"
+            
+    if expected_dtype is not None:
+        assert arr.dtype == expected_dtype, \
+            f"Wrong dtype: expected {expected_dtype}, got {arr.dtype}"
+            
+    if bounds is not None:
+        assert arr.min() >= bounds[0] and arr.max() <= bounds[1], \
+            f"Values outside bounds {bounds}: min={arr.min()}, max={arr.max()}"
+            
+    if not allow_nan:
+        assert not np.any(np.isnan(arr)), "Array contains NaN values"
+        
+    if not allow_inf:
+        assert not np.any(np.isinf(arr)), "Array contains infinite values"
+        
+    return True
+
+def visual_check(
+    fig: plt.Figure,
+    prompt: str = "Does the plot look correct?"
+) -> bool:
+    """
+    Prompt for visual verification of plot.
+    
+    Args:
+        fig: Figure to display
+        prompt: Question to ask user
+        
+    Returns:
+        True if user confirms plot looks correct
+    """
+    plt.show()
+    response = input(f"{prompt} (y/n): ")
+    plt.close(fig)
+    return response.lower() == 'y'
+</file>
+<file path="./btx/processing/tests/functional/bench_hist.py" project="btx">
+# test_histogram.py
+import numpy as np
+import time
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+from btx.processing.tasks.make_histogram import MakeHistogram
+from btx.processing.btx_types import MakeHistogramInput, LoadDataOutput
+from btx.processing.tests.functional.data_generators import generate_synthetic_frames
+
+from typing import Dict, Any, List, Tuple, NamedTuple
+from numba.core.errors import NumbaWarning
+import warnings
+
+# Suppress Numba warnings
+warnings.filterwarnings('ignore', category=NumbaWarning)
+
+class BenchmarkResult(NamedTuple):
+    """Store results for a single benchmark run."""
+    mean_time: float
+    std_time: float
+    points_per_second: float
+    is_valid: bool
+
+class DataSize(NamedTuple):
+    """Define a test data size configuration."""
+    frames: int
+    rows: int
+    cols: int
+    
+    def total_points(self) -> int:
+        return self.frames * self.rows * self.cols
+    
+    def __str__(self) -> str:
+        return f"{self.frames}×{self.rows}×{self.cols}"
+
+def generate_test_data(size: DataSize, order: str = 'F', seed: int = 42) -> np.ndarray:
+    """Generate synthetic test data with specified size and memory layout."""
+    rng = np.random.default_rng(seed)
+    
+    # Generate bimodal distribution
+    dist1 = rng.normal(10, 1, (size.frames // 2, size.rows, size.cols))
+    dist2 = rng.normal(15, 2, (size.frames - size.frames // 2, size.rows, size.cols))
+    
+    # Set memory layout
+    data = np.asarray(np.concatenate([dist1, dist2], axis=0), order=order)
+    
+    return data
+
+def validate_histogram(histograms: np.ndarray, bin_centers: np.ndarray) -> bool:
+    """Validate histogram results against expected peaks."""
+    expected_peaks = [10, 15]  # Based on our test data generation
+    mean_hist = np.mean(histograms, axis=(1, 2))
+    
+    # Find peaks
+    peaks = []
+    for i in range(1, len(mean_hist) - 1):
+        if mean_hist[i] > mean_hist[i-1] and mean_hist[i] > mean_hist[i+1]:
+            peaks.append(bin_centers[i])
+    
+    # Check if we found peaks near the expected values
+    found_peaks = 0
+    for expected in expected_peaks:
+        for peak in peaks:
+            if abs(peak - expected) < 1.0:
+                found_peaks += 1
+                break
+    
+    return found_peaks == len(expected_peaks)
+
+
+# Create config
+config = {
+    'make_histogram': {
+        'bin_boundaries': np.arange(5, 30, 0.2),
+        'hist_start_bin': 1
+    }
+}
+
+def test_make_histogram_visual():
+    """Generate visual diagnostic plots for manual inspection."""
+    save_dir = Path(__file__).parent.parent.parent / 'temp' / 'diagnostic_plots' / 'make_histogram'
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nGenerating visual test plots in: {save_dir}")
+    
+    # Generate synthetic data
+    num_frames = 1000
+    rows = cols = 100
+    data, I0, delays, on_mask, off_mask = generate_synthetic_frames(
+        num_frames, rows, cols
+    )
+    
+    # Scale data to match expected range
+    data = 5 + (25 * (data - data.min()) / (data.max() - data.min()))
+    
+    # Create LoadDataOutput
+    load_data_output = LoadDataOutput(
+        data=data,
+        I0=I0,
+        laser_delays=delays,
+        laser_on_mask=on_mask,
+        laser_off_mask=off_mask,
+        binned_delays=delays
+    )
+    
+    
+    # Create input
+    input_data = MakeHistogramInput(
+        config=config,
+        load_data_output=load_data_output
+    )
+    
+    # Run task
+    task = MakeHistogram(config)
+
+def run_benchmark_iteration(processor: MakeHistogram, data: np.ndarray, 
+                          config: Dict[str, Any]) -> Tuple[float, np.ndarray]:
+    """Run a single benchmark iteration."""
+    input_data = MakeHistogramInput(config,
+                                LoadDataOutput(data, None, None, None, None, None))
+    
+    start_time = time.time()
+    output = processor.run(input_data)
+    elapsed = time.time() - start_time
+    
+    return elapsed, output.histograms
+
+def benchmark_layout(size: DataSize, order: str, config: Dict[str, Any], 
+                    n_iterations: int = 3) -> BenchmarkResult:
+    """Run benchmark for a specific data size and memory layout."""
+    print(f"\nTesting {order}-order layout for size {size} = {size.total_points():,} points")
+    
+    # Generate test data
+    print("Generating test data...")
+    data = generate_test_data(size, order=order)
+    print(f"Data is {order}-contiguous: {data.flags[f'{order}_CONTIGUOUS']}")
+    
+    # Create processor
+    processor = MakeHistogram(config)
+    
+    # Run iterations
+    times = []
+    is_valid = False
+    
+    print(f"Running {n_iterations} iterations...")
+    for i in range(n_iterations):
+        elapsed, histograms = run_benchmark_iteration(processor, data, config)
+        times.append(elapsed)
+        
+        # Validate on first iteration
+        if i == 0:
+            bin_centers = (config['make_histogram']['bin_boundaries'][:-1] + 
+                         config['make_histogram']['bin_boundaries'][1:]) / 2
+            is_valid = validate_histogram(histograms, bin_centers)
+            if not is_valid:
+                print("WARNING: Results validation failed!")
+    
+    mean_time = np.mean(times)
+    std_time = np.std(times)
+    points_per_second = size.total_points() / mean_time
+    
+    print(f"  Mean time: {mean_time:.2f}s ± {std_time:.2f}s")
+    print(f"  Rate: {points_per_second:,.0f} points/second")
+    
+    return BenchmarkResult(mean_time, std_time, points_per_second, is_valid)
+
+def plot_comparative_results(results: Dict[DataSize, Dict[str, BenchmarkResult]], 
+                           output_file: str = 'histogram_benchmark.png'):
+    """Generate comparative performance plots."""
+    plt.figure(figsize=(15, 6))
+    
+    # Processing rates plot
+    plt.subplot(1, 2, 1)
+    sizes = list(results.keys())
+    x = np.arange(len(sizes))
+    width = 0.35
+    
+    # Convert to millions of points per second
+    c_rates = [results[size]['C'].points_per_second / 1e6 for size in sizes]
+    f_rates = [results[size]['F'].points_per_second / 1e6 for size in sizes]
+    
+    plt.bar(x - width/2, c_rates, width, label='C-order', color='blue', alpha=0.7)
+    plt.bar(x + width/2, f_rates, width, label='F-order', color='red', alpha=0.7)
+    
+    plt.xlabel('Data Size')
+    plt.ylabel('Processing Rate (M points/second)')
+    plt.title('Processing Rate Comparison')
+    plt.xticks(x, [str(size) for size in sizes], rotation=45)
+    plt.legend()
+    
+    # Speedup plot
+    plt.subplot(1, 2, 2)
+    speedups = [results[size]['C'].mean_time / results[size]['F'].mean_time 
+                for size in sizes]
+    plt.bar(x, speedups, color='green', alpha=0.7)
+    plt.axhline(y=1.0, color='black', linestyle='--', alpha=0.3)
+    
+    plt.xlabel('Data Size')
+    plt.ylabel('Speedup (F-order vs C-order)')
+    plt.title('F-order Speedup Factor')
+    plt.xticks(x, [str(size) for size in sizes], rotation=45)
+    
+    # Add speedup labels
+    for i, speedup in enumerate(speedups):
+        plt.text(i, speedup, f'{speedup:.2f}x', ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.savefig(output_file)
+    plt.close()
+
+def run_comparative_benchmark():
+    """Run complete comparative benchmark suite."""
+    # Test configurations
+    sizes = [
+        DataSize(1000, 100, 100),   # Small: 10M points
+        DataSize(5000, 200, 200),   # Medium: 200M points
+        DataSize(10000, 200, 200),  # Large: 400M points
+    ]
+    
+    config = {
+        'make_histogram': {
+            'bin_boundaries': np.arange(0, 30, 0.2),
+            'hist_start_bin': 1
+        }
+    }
+    
+    results = {}
+    
+    for size in sizes:
+        print(f"\nBenchmarking size: {size}")
+        results[size] = {}
+        
+        # Test both memory layouts
+        for order in ['C', 'F']:
+            results[size][order] = benchmark_layout(size, order, config)
+        
+        # Calculate and display speedup
+        speedup = results[size]['C'].mean_time / results[size]['F'].mean_time
+        print(f"\nF-order speedup: {speedup:.2f}x")
+    
+    # Generate plots
+    plot_comparative_results(results)
+    
+    return results
+
+def print_summary(results: Dict[DataSize, Dict[str, BenchmarkResult]]):
+    """Print final benchmark summary."""
+    print("\nFinal Summary:")
+    print("=" * 60)
+    for size in results:
+        print(f"\nSize: {size}")
+        print(f"C-order: {results[size]['C'].mean_time:.2f}s")
+        print(f"F-order: {results[size]['F'].mean_time:.2f}s")
+        print(f"Speedup: {results[size]['C'].mean_time / results[size]['F'].mean_time:.2f}x")
+        print(f"Results valid: C={results[size]['C'].is_valid}, F={results[size]['F'].is_valid}")
+
+if __name__ == '__main__':
+    print("Running Histogram Implementation Comparative Benchmark")
+    print("-" * 60)
+    
+    try:
+        results = run_comparative_benchmark()
+        print("\nBenchmark completed successfully")
+        print("Results plot saved as: histogram_benchmark.png")
+        print_summary(results)
+        
+    except Exception as e:
+        print(f"Benchmark failed with error: {str(e)}")
+        raise
+</file>

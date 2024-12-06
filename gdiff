@@ -1,0 +1,637 @@
+diff --git a/btx/processing/tasks/build_pump_probe_masks.py b/btx/processing/tasks/build_pump_probe_masks.py
+index 8a59d88a..8688b60b 100644
+--- a/btx/processing/tasks/build_pump_probe_masks.py
++++ b/btx/processing/tasks/build_pump_probe_masks.py
+@@ -120,7 +120,7 @@ class BuildPumpProbeMasks:
+         Returns:
+             Tuple of (labeled array, ROI cluster mask)
+         """
+-        porous_pixels = p_values > threshold
++        porous_pixels = p_values < threshold
+         labeled_array, _ = ndimage.label(porous_pixels)
+         seed_x = (roi_x_start + roi_x_end) // 2
+         seed_y = (roi_y_start + roi_y_end) // 2
+diff --git a/btx/processing/tests/functional/test_multi_peak.py b/btx/processing/tests/functional/test_multi_peak.py
+new file mode 100644
+index 00000000..8899d2ab
+--- /dev/null
++++ b/btx/processing/tests/functional/test_multi_peak.py
+@@ -0,0 +1,232 @@
++import numpy as np
++from dataclasses import dataclass
++from typing import List, Tuple, Optional
++import matplotlib.pyplot as plt
++from pathlib import Path
++from scipy import ndimage
++import pytest
++
++@dataclass
++class GaussianPeak:
++    """Define a 2D Gaussian peak with Poisson statistics."""
++    center: Tuple[int, int]  # (x, y) center coordinates
++    sigma: float  # Width parameter
++    amplitude: float  # Peak multiplier for lambda
++    
++    def compute_lambda_contribution(self, rows: int, cols: int) -> np.ndarray:
++        """Compute this peak's contribution to the lambda (rate) map."""
++        y, x = np.ogrid[:rows, :cols]
++        x_centered = x - self.center[1]
++        y_centered = y - self.center[0]
++        r_squared = x_centered*x_centered + y_centered*y_centered
++        return self.amplitude * np.exp(-r_squared / (2 * self.sigma**2))
++
++def generate_multi_peak_data(
++    rows: int = 100,
++    cols: int = 100,
++    peaks: List[GaussianPeak] = None,
++    base_counts: float = 100.0,
++    num_frames: int = 1000,
++    num_histogram_bins: int = 50,
++    histogram_range: Tuple[float, float] = (0, 300),
++    background_roi: Optional[Tuple[int, int, int, int]] = None,
++    seed: int = 42,
++    save_total_counts: Optional[Path] = None,
++) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[np.ndarray]]:
++    """
++    Generate synthetic data with multiple 2D Gaussian peaks and Poisson statistics.
++    
++    Args:
++        rows: Number of rows in each frame
++        cols: Number of columns in each frame
++        peaks: List of GaussianPeak objects defining signals
++        base_counts: Base lambda (counts/frame) for background
++        num_frames: Number of frames to generate
++        num_histogram_bins: Number of bins for histograms
++        histogram_range: (min, max) for histogram binning
++        background_roi: (x1, x2, y1, y2) for background ROI
++        seed: Random seed for reproducibility
++        save_total_counts: Optional path to save total counts image
++        
++    Returns:
++        frames: Array of shape (num_frames, rows, cols)
++        histograms: Array of shape (num_histogram_bins, rows, cols)
++        lambda_map: Array of shape (rows, cols) showing true rate
++        true_masks: List of binary masks for each peak
++    """
++    rng = np.random.default_rng(seed)
++    
++    if peaks is None:
++        peaks = []
++        
++    if background_roi is None:
++        background_roi = (0, rows//4, 0, cols//4)
++        
++    # Generate base lambda map
++    lambda_map = np.full((rows, cols), base_counts)
++    
++    # Add peaks
++    for peak in peaks:
++        lambda_map += peak.compute_lambda_contribution(rows, cols) * base_counts
++        
++    # Generate frames with Poisson noise
++    frames = rng.poisson(lam=lambda_map, size=(num_frames, rows, cols))
++    
++    # Compute histograms
++    histograms = np.zeros((num_histogram_bins, rows, cols))
++    bin_edges = np.linspace(histogram_range[0], histogram_range[1], num_histogram_bins + 1)
++    
++    for i in range(rows):
++        for j in range(cols):
++            hist, _ = np.histogram(frames[:, i, j], bins=bin_edges)
++            histograms[:, i, j] = hist
++            
++    # Save total counts image if requested
++    if save_total_counts is not None:
++        total_counts = frames.sum(axis=0)
++        plt.figure(figsize=(8, 8))
++        plt.imshow(total_counts)
++        plt.colorbar(label='Total Counts')
++        plt.title(f'Total Counts Over {num_frames} Frames')
++        plt.savefig(save_total_counts)
++        plt.close()
++            
++    # Generate ground truth masks for each peak
++    true_masks = []
++    for peak in peaks:
++        # Create mask where lambda is significantly elevated above background
++        peak_contribution = peak.compute_lambda_contribution(rows, cols)
++        # Consider points where rate is elevated by at least 10% of peak's amplitude
++        threshold = 0.1 * peak.amplitude
++        mask = peak_contribution > threshold
++        true_masks.append(mask)
++    
++    return frames, histograms, lambda_map, true_masks
++
++def plot_synthetic_data_diagnostics(
++    frames: np.ndarray,
++    histograms: np.ndarray,
++    lambda_map: np.ndarray,
++    true_masks: List[np.ndarray],
++    save_dir: Path,
++    filename: str = 'synthetic_data_diagnostics.png'
++) -> None:
++    """Generate diagnostic plots for synthetic data."""
++    save_dir.mkdir(parents=True, exist_ok=True)
++    
++    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
++    fig.suptitle('Synthetic Data Diagnostics')
++    
++    # Plot lambda map
++    im0 = axes[0, 0].imshow(lambda_map)
++    axes[0, 0].set_title('True λ Map')
++    plt.colorbar(im0, ax=axes[0, 0])
++    
++    # Plot example frame
++    frame_idx = frames.shape[0] // 2  # Middle frame
++    im1 = axes[0, 1].imshow(frames[frame_idx])
++    axes[0, 1].set_title(f'Example Frame (#{frame_idx})')
++    plt.colorbar(im1, ax=axes[0, 1])
++    
++    # Plot mean frame
++    mean_frame = frames.mean(axis=0)
++    im2 = axes[0, 2].imshow(mean_frame)
++    axes[0, 2].set_title('Mean Frame')
++    plt.colorbar(im2, ax=axes[0, 2])
++    
++    # Plot histogram total counts
++    hist_sums = histograms.sum(axis=0)
++    im3 = axes[1, 0].imshow(hist_sums)
++    axes[1, 0].set_title('Histogram Total Counts')
++    plt.colorbar(im3, ax=axes[1, 0])
++    
++    # Plot true masks
++    combined_mask = np.zeros_like(lambda_map)
++    for i, mask in enumerate(true_masks, 1):
++        combined_mask[mask] = i
++    im4 = axes[1, 1].imshow(combined_mask)
++    axes[1, 1].set_title('True Peak Masks')
++    plt.colorbar(im4, ax=axes[1, 1])
++    
++    # Plot example histogram for peak and background
++    if true_masks:
++        peak_center = np.where(true_masks[0])[0][0], np.where(true_masks[0])[1][0]
++        bg_point = 0, 0  # Corner point for background
++        
++        axes[1, 2].plot(histograms[:, peak_center[0], peak_center[1]], 
++                       label='Peak', alpha=0.7)
++        axes[1, 2].plot(histograms[:, bg_point[0], bg_point[1]], 
++                       label='Background', alpha=0.7)
++        axes[1, 2].set_title('Example Histograms')
++        axes[1, 2].legend()
++        axes[1, 2].set_yscale('log')
++    else:
++        axes[1, 2].set_visible(False)
++    
++    plt.tight_layout()
++    plt.savefig(save_dir / filename)
++    plt.close()
++
++def test_synthetic_data_generation():
++    """Test the synthetic data generation with multiple peaks."""
++    # Set up output directory
++    save_dir = Path(__file__).parent.parent.parent / 'temp' / 'diagnostic_plots' / 'synthetic_data'
++    save_dir.mkdir(parents=True, exist_ok=True)
++    
++    # Set parameters consistently
++    base_counts = 100.0
++
++    # Define test peaks
++    peaks = [
++        GaussianPeak(center=(30, 30), sigma=8.0, amplitude=2.0),    # Large peak
++        GaussianPeak(center=(70, 70), sigma=6.0, amplitude=3.0),    # Medium peak
++        GaussianPeak(center=(20, 70), sigma=4.0, amplitude=4.0),    # Small peak
++    ]
++    
++    # Generate data
++    frames, histograms, lambda_map, true_masks = generate_multi_peak_data(
++        peaks=peaks,
++        base_counts=base_counts,  # Use the defined parameter
++        num_frames=1000,
++        seed=42,
++        save_total_counts=save_dir / 'total_counts.png'
++    )
++    
++    # Basic shape checks
++    assert frames.shape[0] == 1000
++    assert frames.shape[1:] == (100, 100)
++    assert histograms.shape[1:] == (100, 100)
++    assert lambda_map.shape == (100, 100)
++    assert len(true_masks) == len(peaks)
++    
++    # Statistical checks
++    # 1. Background region should have mean close to base_counts
++    bg_mean = frames[:, :10, :10].mean()  # Use corner as background
++    assert 95 < bg_mean < 105  # Within 5% of base_counts=100
++    
++    # 2. Check peak centers (where we know the exact expected value)
++    for peak in peaks:
++        x, y = peak.center
++        center_mean = frames[:, x, y].mean()
++        expected_center = base_counts * (1 + peak.amplitude)
++        # Allow 10% tolerance due to Poisson statistics
++        assert abs(center_mean - expected_center) < 0.1 * expected_center, \
++            f"Peak center mean {center_mean:.1f} differs from expected {expected_center:.1f}"
++    
++    # 3. Check Poisson statistics in background
++    bg_var = frames[:, :10, :10].var()
++    # For Poisson, mean ≈ variance
++    assert abs(bg_mean - bg_var) < 0.1 * bg_mean
++    
++    # 4. Check mask sizes are in descending order
++    mask_sizes = [np.sum(mask) for mask in true_masks]
++    assert mask_sizes == sorted(mask_sizes, reverse=True), \
++        "Masks not in descending size order"
++    
++    # Generate diagnostic plots
++    plot_synthetic_data_diagnostics(frames, histograms, lambda_map, true_masks, save_dir)
++
++if __name__ == '__main__':
++    # Run test and generate plots
++    test_synthetic_data_generation()
++    print("\nTest complete. Check the diagnostic plots in the output directory.")
+diff --git a/btx/processing/tests/functional/test_multi_peak_masks.py b/btx/processing/tests/functional/test_multi_peak_masks.py
+new file mode 100644
+index 00000000..c514a477
+--- /dev/null
++++ b/btx/processing/tests/functional/test_multi_peak_masks.py
+@@ -0,0 +1,199 @@
++# test_multi_peak_masks.py
++import numpy as np
++import matplotlib.pyplot as plt
++from pathlib import Path
++from scipy import stats
++from btx.processing.tests.functional.test_multi_peak import (
++    GaussianPeak, 
++    generate_multi_peak_data,
++    plot_synthetic_data_diagnostics
++)
++from btx.processing.tasks.build_pump_probe_masks import BuildPumpProbeMasks
++from btx.processing.btx_types import (
++    BuildPumpProbeMasksInput,
++    MakeHistogramOutput,
++    CalculatePValuesOutput
++)
++
++def test_multi_peak_mask_generation():
++    """Test BuildPumpProbeMasks with synthetic multi-peak data."""
++    # Set up output directory
++    save_dir = Path(__file__).parent.parent.parent / 'temp' / 'diagnostic_plots' / 'multi_peak_masks'
++    save_dir.mkdir(parents=True, exist_ok=True)
++    
++    # Define test peaks of varying sizes and amplitudes
++    peaks = [
++        GaussianPeak(center=(30, 30), sigma=8.0, amplitude=2.0),    # Large peak
++        GaussianPeak(center=(70, 70), sigma=6.0, amplitude=3.0),    # Medium peak
++        GaussianPeak(center=(20, 70), sigma=4.0, amplitude=4.0),    # Small peak
++    ]
++    
++    # Generate synthetic data
++    frames, histograms, lambda_map, true_masks = generate_multi_peak_data(
++        peaks=peaks,
++        base_counts=100.0,
++        num_frames=1000,
++        num_histogram_bins=50,
++        histogram_range=(0, 300),
++        background_roi=(0, 20, 0, 20),
++        seed=42
++    )
++    
++    # Plot synthetic data diagnostics
++    plot_synthetic_data_diagnostics(
++        frames, histograms, lambda_map, true_masks,
++        save_dir,
++        'synthetic_data.png'
++    )
++    
++    # Calculate p-values using likelihood ratio test for Poisson data
++    p_values = np.zeros((100, 100))
++    background_hist = histograms[:, :20, :20].mean(axis=(1,2))  # Use background ROI
++    
++    # Function to calculate likelihood ratio statistic for Poisson data
++    def poisson_likelihood_ratio(observed, expected):
++        """Calculate likelihood ratio statistic for Poisson data.
++        
++        G = 2 * sum(O_i * ln(O_i/E_i) - (O_i - E_i))
++        where O_i are observed counts and E_i are expected counts.
++        """
++        # Handle zeros in observed data
++        mask = observed > 0
++        G = np.zeros_like(observed, dtype=float)
++        G[mask] = observed[mask] * np.log(observed[mask]/expected[mask])
++        return 2 * (np.sum(G) - np.sum(observed - expected))
++
++    for i in range(100):
++        for j in range(100):
++            hist = histograms[:, i, j]
++            
++            # Scale background to match total counts
++            scale = np.sum(hist) / np.sum(background_hist)
++            expected = background_hist * scale
++            
++            # Calculate likelihood ratio statistic
++            G = poisson_likelihood_ratio(hist, expected)
++            
++            # Get p-value from chi-squared distribution
++            # Degrees of freedom = number of bins - 1 (for scaling)
++            dof = np.sum((hist > 0) | (expected > 0)) - 1
++            if dof > 0:  # Only calculate if we have enough data
++                p_values[i, j] = stats.chi2.sf(G, dof)
++            else:
++                p_values[i, j] = 1.0
++
++    # Add p-value calculation debugging
++    print("\nP-value Statistics:")
++    print(f"Range: {p_values.min():.2e} to {p_values.max():.2e}")
++    print(f"Mean: {p_values.mean():.2e}")
++    print(f"Median: {np.median(p_values):.2e}")
++    
++    # Visualize p-values
++    fig, axes = plt.subplots(2, 2, figsize=(15, 15))
++    fig.suptitle('P-value Debugging')
++    
++    # 1. Lambda map (true signal)
++    im0 = axes[0, 0].imshow(lambda_map)
++    axes[0, 0].set_title('True λ Map')
++    plt.colorbar(im0, ax=axes[0, 0])
++    
++    # 2. P-value map
++    im1 = axes[0, 1].imshow(p_values)
++    axes[0, 1].set_title('P-values')
++    plt.colorbar(im1, ax=axes[0, 1])
++    
++    # 3. Log p-value map
++    log_p = -np.log10(p_values + 1e-20)  # Add small constant to avoid log(0)
++    im2 = axes[1, 0].imshow(log_p)
++    axes[1, 0].set_title('-log10(P-values)')
++    plt.colorbar(im2, ax=axes[1, 0])
++    
++    # 4. Significant pixels mask
++    significant = p_values < 0.05
++    im3 = axes[1, 1].imshow(significant)
++    axes[1, 1].set_title('Significant Pixels (p < 0.05)')
++    plt.colorbar(im3, ax=axes[1, 1])
++    
++    plt.savefig(save_dir / 'pvalue_debug.png')
++    plt.close()
++
++    # Print cluster identification debug info
++    print("\nCluster Identification Debug:")
++    significant_count = np.sum(significant)
++    print(f"Number of significant pixels: {significant_count}")
++    print(f"Background ROI significant pixels: {np.sum(significant[0:20, 0:20])}")
++
++    # Create input data structures
++    histogram_output = MakeHistogramOutput(
++        histograms=histograms,
++        bin_edges=np.linspace(0, 300, 51),  # One more than bins
++        bin_centers=np.linspace(3, 297, 50)  # Center of each bin
++    )
++    
++    p_values_output = CalculatePValuesOutput(
++        p_values=p_values,
++        log_p_values=-np.log10(p_values),
++        significance_threshold=0.05
++    )
++    
++    # Configure mask builder
++    config = {
++        'setup': {
++            'background_roi_coords': [0, 20, 0, 20]  # Same as used in synthetic data
++        },
++        'generate_masks': {
++            'threshold': 0.05,
++            'bg_mask_mult': 2.0,
++            'bg_mask_thickness': 5,
++            'max_peaks': 10,
++            'min_peak_size': 10
++        }
++    }
++    
++    # Create and run mask builder
++    mask_builder = BuildPumpProbeMasks(config)
++    input_data = BuildPumpProbeMasksInput(
++        config=config,
++        histogram_output=histogram_output,
++        p_values_output=p_values_output
++    )
++    
++    output = mask_builder.run(input_data)
++    
++    # Generate diagnostics
++    mask_builder.plot_diagnostics(output, save_dir)
++    
++    # Add comparison plot of true vs found masks
++    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
++    fig.suptitle('True vs Found Masks Comparison')
++    
++    # True masks
++    combined_true = np.zeros((100, 100))
++    for i, mask in enumerate(true_masks, 1):
++        combined_true[mask] = i
++    ax1.imshow(combined_true)
++    ax1.set_title('True Peak Regions')
++    
++    # Found masks
++    combined_found = np.zeros((100, 100))
++    for i, pair in enumerate(output.mask_pairs, 1):
++        combined_found[pair.signal_mask] = i
++    ax2.imshow(combined_found)
++    ax2.set_title('Found Signal Masks')
++    
++    plt.savefig(save_dir / 'mask_comparison.png')
++    plt.close()
++    
++    # Print some statistics
++    print("\nMask Generation Results:")
++    print(f"Number of true peaks: {len(true_masks)}")
++    print(f"Number of found peaks: {len(output.mask_pairs)}")
++    
++    # Compare mask sizes
++    print("\nMask Sizes:")
++    print("True masks:", [np.sum(mask) for mask in true_masks])
++    print("Found masks:", [pair.size for pair in output.mask_pairs])
++
++if __name__ == '__main__':
++    test_multi_peak_mask_generation()
++    print("\nTest complete. Check the diagnostic plots in the output directory.")
+diff --git a/btx/processing/xpp/docs/profiling/beamer/xpp.pdf b/btx/processing/xpp/docs/profiling/beamer/xpp.pdf
+index 4549e1e4..16d33925 100644
+Binary files a/btx/processing/xpp/docs/profiling/beamer/xpp.pdf and b/btx/processing/xpp/docs/profiling/beamer/xpp.pdf differ
+diff --git a/btx/processing/xpp/docs/profiling/beamer/xpp.tex b/btx/processing/xpp/docs/profiling/beamer/xpp.tex
+index 216908f8..da3c3623 100644
+--- a/btx/processing/xpp/docs/profiling/beamer/xpp.tex
++++ b/btx/processing/xpp/docs/profiling/beamer/xpp.tex
+@@ -52,7 +52,7 @@
+         \end{itemize}
+     \item \textcolor{blue}{MakeHistogram: 11.27s (41.9\%)}
+         \begin{itemize}
+-        \item Histogram calculation: 11.27s
++          \item Histogram calculation: 11.27s with JIT compiler (down from $>60s$ unoptimized)
+         \end{itemize}
+     \item \textcolor{green}{Signal Analysis: 2.72s (10.1\%)}
+         \begin{itemize}
+@@ -84,14 +84,13 @@
+ 
+ \begin{frame}{Data loading differences}
+ \begin{itemize}
+-\item Two distinct analysis workflows for different datasets
++  \item Two distinct event selection and delay calculation workflows for different datasets
+ \item Key differences in:
+     \begin{itemize}
+     \item HDF5 path structures
+     \item Event classification methods
+     \item Detector mask handling
+     \item Filter parameters
+-    \item Data processing approaches
+     \end{itemize}
+ \end{itemize}
+ \end{frame}
+@@ -106,7 +105,7 @@
+ \textbf{Dataset B: xppl1030522}
+ \begin{itemize}
+ \item Uses \texttt{enc/lasDelay2} directly
+-\item Different delay calculation methodology
++\item Different delay calculation formula
+ \end{itemize}
+ 
+ \textbf{Impact:} Different delay calculations affect time binning and resolution
+@@ -169,12 +168,12 @@ roi0_mask = ROI_0__ROI_0_mask[0]
+ \begin{frame}{Filter Parameters}
+ \textbf{IPM Position Filters:}
+ \begin{itemize}
+-\item \textbf{Dataset A:}
++  \item \textbf{Dataset A (dynamically calculated):}
+     \begin{itemize}
+-    \item X: [-0.2, 0.2]
+-    \item Y: [-0.5, 0.5]
++    \item X: [-0.25, 0.45]
++    \item Y: [-0.6, 0.8]
+     \end{itemize}
+-\item \textbf{Dataset B:}
++\item \textbf{Dataset B:(hardcoded in script parameters)}
+     \begin{itemize}
+     \item X: [-0.45, 0.45]
+     \item Y: [-1.6, 0.0]
+@@ -182,23 +181,101 @@ roi0_mask = ROI_0__ROI_0_mask[0]
+ \end{itemize}
+ \end{frame}
+ 
++%\begin{frame}{TimeTool Integration}
++%\begin{columns}
++%\column{0.5\textwidth}
++%\textbf{Dataset A}
++%\begin{itemize}
++%\item Optional usage
++%\item Configurable threshold
++%\item Laser-on events only
++%\end{itemize}
++%
++%\column{0.5\textwidth}
++%\textbf{Dataset B}
++%\begin{itemize}
++%\item Always enabled
++%\item Fixed threshold
++%\item All events
++%\end{itemize}
++%\end{columns}
++%\end{frame}
++
++%\begin{frame}{TimeTool Integration}
++%\begin{columns}
++%\column{0.5\textwidth}
++%\textbf{Dataset A}
++%\begin{itemize}
++%\item Always enabled
++%\item Fixed threshold
++%\item All events
++%\end{itemize}
++%
++%\begin{lstlisting}[language=Python]
++%filters = {
++%    'tt_amp': [0.015, np.inf]
++%}
++%
++%# Applied to all events except 
++%# laser-off for tt specifically
++%if 'tt' not in key:  
++%    laser_off_mask = np.logical_and(
++%        laser_off_mask, 
++%        value_filter)
++%\end{lstlisting}
++%
++%\column{0.5\textwidth}
++%\textbf{Dataset B}
++%\begin{itemize}
++%\item Optional usage
++%\item Configurable threshold
++%\item Laser-on events only
++%\end{itemize}
++%
++%\begin{lstlisting}[language=Python]
++%# Optional timetool filter
++%if use_timetool:
++%    filters['tt_amp'] = [0.0, np.inf]
++%
++%# Only applies to laser-on events
++%if key == 'tt_amp':
++%    laser_on_mask = np.logical_and(
++%        laser_on_mask, 
++%        value_filter)
++%\end{lstlisting}
++%\end{columns}
++%\end{frame}
++
+ \begin{frame}{TimeTool Integration}
+ \begin{columns}
+ \column{0.5\textwidth}
+ \textbf{Dataset A}
+ \begin{itemize}
+-\item Optional usage
+-\item Configurable threshold
+-\item Laser-on events only
++\item Always enabled
++\item Fixed threshold
+ \end{itemize}
+ 
++\texttt{\# Fixed threshold in filters}\\
++\texttt{filters['tt\_amp'] = [0.015, inf]}\\
++\vspace{0.5cm}
++\texttt{\# Skip tt filter for laser-off}\\
++\texttt{if 'tt' not in key:}\\
++\texttt{~~~~laser\_off\_mask = mask and filt}
++
+ \column{0.5\textwidth}
+ \textbf{Dataset B}
+ \begin{itemize}
+-\item Always enabled
+-\item Fixed threshold
+-\item All events
++\item Optional usage
++\item Configurable threshold
+ \end{itemize}
++
++\texttt{\# Optional timetool usage}\\
++\texttt{if use\_timetool:}\\
++\texttt{~~~~filters['tt\_amp'] = [0.0, inf]}\\
++\vspace{0.5cm}
++\texttt{\# Laser-on events only}\\
++\texttt{if key == 'tt\_amp':}\\
++\texttt{~~~~laser\_on\_mask = mask and filt}
+ \end{columns}
+ \end{frame}
+ 
+diff --git a/pipeline_results/diagnostics/build_masks/mask_distance.png b/pipeline_results/diagnostics/build_masks/mask_distance.png
+index 9af330ee..8a599662 100644
+Binary files a/pipeline_results/diagnostics/build_masks/mask_distance.png and b/pipeline_results/diagnostics/build_masks/mask_distance.png differ
+diff --git a/pipeline_results/diagnostics/build_masks/mask_generation_stages.png b/pipeline_results/diagnostics/build_masks/mask_generation_stages.png
+index 7c0c5a1d..0f9b1fe1 100644
+Binary files a/pipeline_results/diagnostics/build_masks/mask_generation_stages.png and b/pipeline_results/diagnostics/build_masks/mask_generation_stages.png differ
+diff --git a/pipeline_results/diagnostics/calculate_pvalues/calculate_pvalues_diagnostics.png b/pipeline_results/diagnostics/calculate_pvalues/calculate_pvalues_diagnostics.png
+index 8cde009c..e540b9ff 100644
+Binary files a/pipeline_results/diagnostics/calculate_pvalues/calculate_pvalues_diagnostics.png and b/pipeline_results/diagnostics/calculate_pvalues/calculate_pvalues_diagnostics.png differ
+diff --git a/pipeline_results/diagnostics/measure_emd/measure_emd_diagnostics.png b/pipeline_results/diagnostics/measure_emd/measure_emd_diagnostics.png
+index 9893c18c..836fddbe 100644
+Binary files a/pipeline_results/diagnostics/measure_emd/measure_emd_diagnostics.png and b/pipeline_results/diagnostics/measure_emd/measure_emd_diagnostics.png differ
+diff --git a/pipeline_results/diagnostics/pump_probe/overview_diagnostics.png b/pipeline_results/diagnostics/pump_probe/overview_diagnostics.png
+index 62f3ac6c..c5b2d25a 100644
+Binary files a/pipeline_results/diagnostics/pump_probe/overview_diagnostics.png and b/pipeline_results/diagnostics/pump_probe/overview_diagnostics.png differ
